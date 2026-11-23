@@ -35,6 +35,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -413,26 +414,38 @@ def open_url(url: str, user: str, token: str, timeout: int = 60, *, method: str 
     return urllib.request.urlopen(request, timeout=timeout)
 
 
-def head_content_length(url: str, user: str, token: str) -> int | None:
-    """Return Content-Length via HEAD when possible; None if unknown/unsupported."""
+def head_content_length(url: str, user: str, token: str, *, timeout: int = 10) -> int | None:
+    """Return Content-Length for size estimates. Never raises (timeouts → None).
+
+    Prefer a 1-byte ranged GET: some Lightwell/CDN edges hang or omit length on HEAD.
+    """
     try:
-        with open_url(url, user, token, timeout=30, method="HEAD") as response:
+        size = _content_length_via_range(url, user, token, timeout=timeout)
+        if size is not None:
+            return size
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+    # Fallback HEAD (short). Swallow all probe failures.
+    try:
+        with open_url(url, user, token, timeout=timeout, method="HEAD") as response:
             raw = response.headers.get("Content-Length")
             if raw and raw.isdigit():
                 return int(raw)
-            return None
     except urllib.error.HTTPError as exc:
-        # Some gateways reject HEAD; try a 1-byte ranged GET for length only.
         if exc.code in {401, 403}:
             raise SystemExit(auth_error_hint(exc.code, url, _read_http_error(exc))) from exc
-        if exc.code in {405, 501}:
-            return _content_length_via_range(url, user, token)
         return None
-    except urllib.error.URLError:
+    except Exception:
         return None
+    return None
 
 
-def _content_length_via_range(url: str, user: str, token: str) -> int | None:
+def _content_length_via_range(
+    url: str, user: str, token: str, *, timeout: int = 10
+) -> int | None:
     request = urllib.request.Request(
         url,
         headers={
@@ -442,7 +455,7 @@ def _content_length_via_range(url: str, user: str, token: str) -> int | None:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             # Content-Range: bytes 0-0/12345
             content_range = response.headers.get("Content-Range") or ""
             if "/" in content_range:
@@ -452,9 +465,25 @@ def _content_length_via_range(url: str, user: str, token: str) -> int | None:
             raw = response.headers.get("Content-Length")
             if raw and raw.isdigit():
                 return int(raw)
-    except (urllib.error.HTTPError, urllib.error.URLError):
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise SystemExit(auth_error_hint(exc.code, url, _read_http_error(exc))) from exc
+        return None
+    except Exception:
         return None
     return None
+
+
+def is_estimate_binary(name: str) -> bool:
+    """Main package binaries for sizing (skip metadata, provenance, classifier jars)."""
+    lower = name.lower()
+    if is_provenance_bundle(name):
+        return False
+    if is_classifier_jar(name):
+        return False
+    if lower.endswith((".pom", ".xml", ".module", ".md5", ".sha1", ".sha256", ".sha512", ".asc")):
+        return False
+    return lower.endswith((".jar", ".war", ".ear", ".aar", ".whl", ".tar.gz", ".tgz"))
 
 
 def _read_http_error(exc: urllib.error.HTTPError) -> str:
@@ -1525,6 +1554,42 @@ def _name_matches_filter(name: str, name_filter: str) -> bool:
     return name_filter.lower() in name.lower()
 
 
+def _java_matches_filter(name: str, url: str, name_filter: str) -> bool:
+    """Match filter against artifact name or full Maven URL path (e.g. …/awssdk/…)."""
+    if not name_filter:
+        return True
+    needle = name_filter.lower().replace(".", "/")
+    hay_name = name.lower()
+    hay_url = urllib.parse.unquote(url).lower()
+    return (
+        name_filter.lower() in hay_name
+        or name_filter.lower() in hay_url
+        or needle in hay_url
+    )
+
+
+def _java_estimate_seed_urls(root_url: str, name_filter: str) -> list[str]:
+    """Prefer jumping into a Maven group/artifact path when the filter looks like one."""
+    root = ensure_trailing_slash(root_url)
+    seeds: list[str] = []
+    raw = (name_filter or "").strip().strip("/")
+    if raw:
+        # software.amazon.awssdk  or  software/amazon/awssdk
+        path = raw.replace(".", "/") if "/" not in raw and " " not in raw else raw
+        # Bare tokens like "awssdk" are not full paths — don't invent a root child.
+        if "/" in path or "." in raw:
+            seeds.append(urllib.parse.urljoin(root, path.strip("/") + "/"))
+    seeds.append(root)
+    # Dedupe, preserve order
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in seeds:
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
 def collect_python_estimate_targets(
     index_url: str, user: str, token: str, name_filter: str, max_artifacts: int
 ) -> list[tuple[str, str]]:
@@ -1545,49 +1610,94 @@ def collect_python_estimate_targets(
     return targets
 
 
+def _java_dir_sort_key(name: str, url: str, needle: str) -> tuple:
+    """Lower sort key = explore sooner (filter hits and common Maven roots first)."""
+    n = name.rstrip("/").lower()
+    u = urllib.parse.unquote(url).lower()
+    common_roots = {
+        "software",
+        "com",
+        "org",
+        "io",
+        "net",
+        "jakarta",
+        "javax",
+        "redis",
+        "cn",
+        "edu",
+    }
+    if needle:
+        needle_path = needle.replace(".", "/")
+        if n == needle or n == needle_path.rsplit("/", 1)[-1]:
+            return (0, n)
+        if needle in n or needle in u or needle_path in u:
+            return (1, n)
+    if n in common_roots:
+        return (2, n)
+    return (3, n)
+
+
 def collect_java_estimate_targets(
     root_url: str, user: str, token: str, name_filter: str, max_artifacts: int
 ) -> list[tuple[str, str]]:
-    """BFS Maven directories; collect artifact URLs until max_artifacts."""
+    """Walk Maven directories; collect artifact URLs until max_artifacts."""
     targets: list[tuple[str, str]] = []
-    queue: list[str] = [ensure_trailing_slash(root_url)]
+    queue: deque[str] = deque(_java_estimate_seed_urls(root_url, name_filter))
     seen_dirs: set[str] = set()
-    # Bound directory walks so a huge tree cannot explode before the artifact cap.
-    max_dirs = max(50, max_artifacts * 5)
+    # Deep Maven trees need many directory visits before the first matching jar.
+    max_dirs = max(2000, max_artifacts * 50)
+    needle = (name_filter or "").lower()
+
+    ui_info(f"java walk cap {max_dirs} directories (artifact cap {max_artifacts})")
+    if needle and "/" not in needle and "." not in needle:
+        ui_info(
+            "tip: path filters find Maven groupIds faster, e.g. "
+            "--filter software/amazon/awssdk"
+        )
 
     while queue and len(targets) < max_artifacts and len(seen_dirs) < max_dirs:
-        current = queue.pop(0)
+        current = queue.popleft()
         if current in seen_dirs:
             continue
         seen_dirs.add(current)
+        if len(seen_dirs) == 1 or len(seen_dirs) % 25 == 0:
+            path_hint = urllib.parse.urlsplit(current).path
+            ui_info(f"listed {len(seen_dirs)} dirs · queued {len(queue)} · at {path_hint}")
+
         try:
             directories, artifacts, _provenance = list_java_entries(current, user, token)
         except SystemExit as exc:
-            # Auth errors should still abort; skip soft listing failures.
-            if "HTTP 401" in str(exc) or "HTTP 403" in str(exc):
+            msg = str(exc)
+            if "HTTP 401" in msg or "HTTP 403" in msg:
                 raise
+            # Seeded group paths may 404 if the filter isn't an exact path prefix.
+            if "HTTP 404" in msg and current != ensure_trailing_slash(root_url):
+                ui_warn(f"path not found, continuing from repo root: {current}")
+                continue
             ui_warn(f"skip listing {current}: {exc}")
             continue
 
         for name, url in artifacts:
-            if not _name_matches_filter(name, name_filter):
+            if not is_estimate_binary(name):
                 continue
-            # Prefer binary jars over metadata noise when filtering isn't set.
-            if not name_filter and name.lower().endswith((".pom", ".xml", ".module")):
+            if not _java_matches_filter(name, url, name_filter):
                 continue
             targets.append((name, url))
             if len(targets) >= max_artifacts:
                 break
 
-        for name, url in directories:
-            if name_filter and not _name_matches_filter(name.rstrip("/"), name_filter):
-                # Still descend if filter might match deeper (group path segments).
-                # Only prune when the filter looks like a filename fragment with a dot.
-                if "." in name_filter:
-                    continue
-            if url not in seen_dirs:
-                queue.append(url)
+        children = [(name, url) for name, url in directories if url not in seen_dirs]
+        children.sort(key=lambda item: _java_dir_sort_key(item[0], item[1], needle))
+        # Explore best matches first (appendleft in reverse so first key is next).
+        for _name, url in reversed(children):
+            queue.appendleft(url)
 
+    if not targets and seen_dirs:
+        ui_warn(
+            f"walked {len(seen_dirs)} directories without matching artifacts "
+            f"(filter={name_filter!r}). Try a path-like filter, e.g. "
+            f"--filter software/amazon/awssdk or --filter software.amazon.awssdk"
+        )
     return targets
 
 
@@ -1648,22 +1758,31 @@ def run_estimate_size(
         ui_warn("no artifacts found to measure (check --repo / --filter)")
         return 1
 
-    ui_step(f"HEAD {len(targets)} artifacts")
+    ui_step(f"Probe size for {len(targets)} artifacts")
     measured = 0
     unknown = 0
     total_bytes = 0
     largest: list[tuple[int, str]] = []
 
     for i, (name, url) in enumerate(targets, start=1):
-        size = head_content_length(url, user, token)
+        print(f"  {dim(f'{i:>3}')}  {name}  {dim('…')}", end="", flush=True)
+        try:
+            size = head_content_length(url, user, token)
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001 — never abort the whole estimate on one probe
+            size = None
+            print(f"\r  {dim(f'{i:>3}')}  {name}  {yellow('?')}  {dim(str(exc)[:60])}")
+            unknown += 1
+            continue
         if size is None:
             unknown += 1
-            print(f"  {dim(f'{i:>3}')}  {name}  {yellow('?')}")
+            print(f"\r  {dim(f'{i:>3}')}  {name}  {yellow('? (timeout/no length)')}")
         else:
             measured += 1
             total_bytes += size
             largest.append((size, name))
-            print(f"  {dim(f'{i:>3}')}  {name}  {green(human_size(size))}")
+            print(f"\r  {dim(f'{i:>3}')}  {name}  {green(human_size(size))}")
 
     largest.sort(reverse=True)
 

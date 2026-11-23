@@ -4,6 +4,17 @@ Interactive helper to browse registry directory listings / index APIs and downlo
 
 > **Disclaimer:** This script is **not an officially supported Red Hat product or tool**. It is an unofficial helper that lets users interactively crawl Lightwell registry directories (and related index/Integrity endpoints) and download the packages they need. For supported day-to-day workflows, configure your build tools or on-prem repository managers (Artifactory / Nexus) per [Red Hat Lightwell Network documentation](https://docs.redhat.com/en/documentation/lightwell_network/current).
 
+
+## Architecture (what talks to what)
+
+| Need | Mechanism | Auth | Script |
+|---|---|---|---|
+| Download packages / provenance | `packages.redhat.com` registry | Registry SA Basic Auth (`LW_USER` / `LW_TOKEN`) | `lightwell_download_python_remediated.py` |
+| **Security advisories** | Pre-published **OSV JSON** under `/lightwell/osv/…` (fetch + filter locally — not a live advisory search API) | Same Registry SA | `lightwell_osv_advisories.py` |
+| Catalog package/version **counts** (Lens-style) | Hybrid Console content-sources API | Hybrid Console SA Bearer (`RH_CLIENT_*`) | `lightwell_catalog_api.py` |
+
+For integrations that need “which CVEs did Lightwell remediate for package X?”, sync the OSV trees and query the local cache. Do not rely on content-sources as a real-time advisory query API.
+
 ## Capabilities
 
 | Capability | What it does |
@@ -14,6 +25,8 @@ Interactive helper to browse registry directory listings / index APIs and downlo
 | **Auto provenance (Python)** | After each `.whl` download, fetch PEP 740 provenance via the Pulp Integrity API (`<wheel>.provenance.json`) |
 | **View / verify attestation** | Compact attestation summary; optional full JSON; `cosign` verify (PNC key 1 for Java, RELEASE3 for Python) |
 | **Size estimate** | `--estimate-size`: HEAD-only `Content-Length` sample with `--filter` and `--max-artifacts` cap (not a full-catalog mirror) |
+| **OSV advisories** | Separate script: sync pre-published OSV JSON from the registry, filter locally (`lightwell_osv_advisories.py`) |
+| **Catalog API** | Separate script: Lens-style package/version counts via content-sources Bearer API (`lightwell_catalog_api.py`) |
 | **Terminal UX** | Color on TTY (`NO_COLOR=1` to disable); step markers; post-download **Summary** (artifact + attestation notes) |
 
 **How browsing works (not a bulk crawler):**
@@ -24,7 +37,7 @@ Interactive helper to browse registry directory listings / index APIs and downlo
 
 The script only follows paths you select (plus one automatic provenance companion fetch when applicable). It does **not** recursively mirror an entire repository.
 
-This talks to the **package registry** (`packages.redhat.com`, Basic Auth), not the Lightwell **content-sources API** on `console.redhat.com` (Bearer token / metadata).
+This talks to the **package registry** (`packages.redhat.com`, Basic Auth), not the Lightwell **content-sources API** on `console.redhat.com` (Bearer token / metadata). For catalog-scale package/version counts, use [`lightwell_catalog_api.py`](#catalog-api-lens--content-sources) below.
 
 ## Supported repositories
 
@@ -135,6 +148,99 @@ python3 lightwell_download_python_remediated.py \
 
 Uses `HEAD` (or a 1-byte ranged GET fallback) for `Content-Length`, stops at `--max-artifacts` (default 200), and prints measured total + largest samples. Prefer Artifactory/Nexus **cache growth metrics** for production disk planning.
 
+For **Java**, `--filter` matches the artifact **name or URL path** (so `awssdk` matches jars under `…/software/amazon/awssdk/…`). Path-like filters are much faster on large Maven trees:
+
+```bash
+python3 lightwell_download_python_remediated.py \
+  --estimate-size --repo java-validated \
+  --filter software/amazon/awssdk --max-artifacts 20
+```
+
+
+### OSV advisories (registry JSON — preferred for integrations)
+
+Lightwell publishes advisories as **OSV-format JSON files** at authenticated registry endpoints (same Terms-based Registry SA as package downloads). Sync them and filter locally:
+
+| Tree | URL |
+|---|---|
+| Java remediated | `https://packages.redhat.com/lightwell/osv/java/remediated/` |
+| Java predisclosure | `https://packages.redhat.com/lightwell/osv/java/predisclosure/` |
+| Python remediated | `https://packages.redhat.com/lightwell/osv/python/remediated/` |
+| Python predisclosure | `https://packages.redhat.com/lightwell/osv/python/predisclosure/` |
+
+```bash
+export LW_USER='XXXXXXX|service-account-name'
+export LW_TOKEN='your-token'
+
+# Download OSV JSON into download/osv/
+python3 lightwell_osv_advisories.py sync --ecosystem java --tier remediated
+
+# Local filters
+python3 lightwell_osv_advisories.py list --package json-path
+python3 lightwell_osv_advisories.py list --cve CVE-2023-51074 --json
+python3 lightwell_osv_advisories.py show --id RHLW-2026-f8f17f4598510b8d
+python3 lightwell_osv_advisories.py match --packages-file my-deps.txt
+
+# Optional: public GitHub mirror (no registry auth)
+python3 lightwell_osv_advisories.py sync --source github
+```
+
+Public mirror also used by osv.dev: [project-lightwell/lightwell-osv](https://github.com/project-lightwell/lightwell-osv).
+
+### Catalog API (Lens / content-sources)
+
+For **full catalog package/version counts** (what Lens shows), use a separate script against the Hybrid Console content-sources API — not the registry downloader, and not `--estimate-size`.
+
+Per [Lightwell Network API access](https://docs.redhat.com/en/documentation/lightwell_network/current/get_started-lightwell_network_api_access):
+
+1. Use a **Hybrid Console** service account (`console.redhat.com` → Settings → Service Accounts) — **not** the registry SA (`1234567|name`). Registry tokens are Basic Auth for `packages.redhat.com` only; they are **not** valid as `Authorization: Bearer` for `console.redhat.com/api`.
+2. Put the SA in a User Access group with **Repositories viewer**.
+3. Confirm `$TOKEN` is an SSO `access_token` JWT (`eyJ…`), not `$LW_TOKEN`.
+
+```bash
+# Hybrid Console SA (Get Started names CLIENT_ID / CLIENT_SECRET also work)
+export CLIENT_ID='...'            # or RH_CLIENT_ID
+export CLIENT_SECRET='...'        # or RH_CLIENT_SECRET
+
+# 2) Token request — expect access_token + expires_in
+curl -s https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token \
+  -d grant_type=client_credentials \
+  -d client_id="$CLIENT_ID" \
+  -d client_secret="$CLIENT_SECRET" \
+  -d scope=api.console | jq 'keys'
+
+export TOKEN=$(curl -s https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token \
+  -d grant_type=client_credentials \
+  -d client_id="$CLIENT_ID" \
+  -d client_secret="$CLIENT_SECRET" \
+  -d scope=api.console | jq -r .access_token)
+
+# 3) Sanity — list Lightwell repositories
+curl -s 'https://console.redhat.com/api/content-sources/v1.0/lightwell/repositories/' \
+  -H "Authorization: Bearer $TOKEN" | jq . | head -40
+
+# Separate: org Lightwell membership via registry SA (200 = entitlement OK)
+curl -s -o /dev/null -w '%{http_code}\n' -u "$LW_USER:$LW_TOKEN" \
+  https://packages.redhat.com/lightwell/java/remediated/com/fasterxml/woodstox/woodstox-core/maven-metadata.xml
+
+# Or run the same checklist in one go:
+python3 lightwell_catalog_api.py doctor
+
+# Package + version counts by ecosystem × security level (meta.count)
+python3 lightwell_catalog_api.py summary
+
+# Optional filters
+python3 lightwell_catalog_api.py summary --ecosystem maven --security-level validated
+
+# List rows (paginated)
+python3 lightwell_catalog_api.py packages --ecosystem python --security-level remediated --limit 20
+python3 lightwell_catalog_api.py versions --ecosystem npm --name lodash --json
+# Optional metadata probe (not the preferred advisory integration path — use OSV sync)
+python3 lightwell_catalog_api.py advisories --severity-min important --limit 10
+```
+
+OpenAPI: `https://console.redhat.com/api/content-sources/v1.0/openapi.json` (`/lightwell/packages`, `/lightwell/package_versions`).
+
 ## Minimal on-prem Artifactory / Nexus layout
 
 Recommended production path: **proxy Lightwell into JFrog Artifactory or Sonatype Nexus** near consumers; point CI at the on-prem URL. Keep this script for inspection, provenance checks, and one-off downloads — not as the distribution bus.
@@ -222,10 +328,10 @@ curl -i -u "$LW_USER:$LW_TOKEN" \
 | `cosign` not found | Install cosign to verify; `--view-provenance` still works without it |
 | Estimate looks “too small” | Expected — `--max-artifacts` samples only; not a full catalog total |
 
-## Not in scope
+## Not in script's scope
 
-- Lightwell Network **API** (`console.redhat.com/api/content-sources/…`) — catalog, advisories, metadata with Bearer tokens
-- Installing into an environment (`pip` / Maven / Gradle / npm) — this script only downloads (or HEADs) files
+- Installing into an environment (`pip` / Maven / Gradle / npm) — the downloader only fetches (or HEADs) files
 - Full-catalog mirroring or official Windows Server storage sizing from Red Hat
+- Treating content-sources as a live advisory search API — use OSV JSON sync instead (`lightwell_osv_advisories.py`)
 
 For day-to-day dependency resolution, configure Artifactory/Nexus (or your build tool) against Lightwell remote URLs instead of downloading by hand.

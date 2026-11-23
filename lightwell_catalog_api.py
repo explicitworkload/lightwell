@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""
+Query the Lightwell Network content-sources catalog API (console.redhat.com).
+
+This is separate from lightwell_download_python_remediated.py:
+  - Downloader  → packages.redhat.com (registry Basic Auth) — fetch binaries
+  - This script → console.redhat.com/api/content-sources (Bearer token) — catalog counts/metadata
+
+Auth (Hybrid Console service account — NOT the registry XXXXXXX|name token):
+  1. Create a service account in Hybrid Cloud Console (Settings → Service Accounts)
+  2. Add it to a User Access group with the Repositories viewer role
+  3. export RH_CLIENT_ID='...' RH_CLIENT_SECRET='...'
+     or export LW_API_TOKEN='...' (short-lived Bearer from scope=api.console, ~15 min)
+
+Docs:
+  https://docs.redhat.com/en/documentation/lightwell_network/current/get_started-lightwell_network_api_access
+
+Unofficial helper — not an officially supported Red Hat product.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+SSO_TOKEN_URL = (
+    "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+)
+CONSOLE_ORIGIN = "https://console.redhat.com"
+API_BASE = f"{CONSOLE_ORIGIN}/api/content-sources/v1.0"
+# Preferred first. SSO may still mint a token with a non-console scope that console rejects (401).
+TOKEN_SCOPES = (
+    "api.console",
+    "openid api.console",
+    "openid api.iam.service_accounts",
+)
+
+ECOSYSTEMS = ("maven", "python", "npm")
+SECURITY_LEVELS = ("validated", "remediated")
+
+# Get Started sanity probe first, then broader console/content-sources checks.
+# 401 = JWT not accepted; 200/403 = gateway accepted the Bearer token.
+AUTH_PROBE_PATHS = (
+    "/api/content-sources/v1.0/lightwell/repositories/",
+    "/api/content-sources/v1.0/repositories/?limit=1",
+    "/api/content-sources/v1.0/lightwell/packages?limit=1",
+    "/api/rbac/v1/access/?application=content-sources",
+)
+
+# Registry membership check (Basic Auth) — separate from API Bearer setup.
+REGISTRY_MEMBERSHIP_URL = (
+    "https://packages.redhat.com/lightwell/java/remediated/"
+    "com/fasterxml/woodstox/woodstox-core/maven-metadata.xml"
+)
+
+
+def _color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return sys.stdout.isatty()
+
+
+_USE_COLOR = _color_enabled()
+
+
+def _paint(code: str, text: str) -> str:
+    if not _USE_COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def bold(text: str) -> str:
+    return _paint("1", text)
+
+
+def dim(text: str) -> str:
+    return _paint("2", text)
+
+
+def green(text: str) -> str:
+    return _paint("32", text)
+
+
+def yellow(text: str) -> str:
+    return _paint("33", text)
+
+
+def cyan(text: str) -> str:
+    return _paint("36", text)
+
+
+def red(text: str) -> str:
+    return _paint("31", text)
+
+
+def ui_step(title: str) -> None:
+    print()
+    print(bold(cyan(f"▸ {title}")))
+
+
+def ui_ok(msg: str) -> None:
+    print(green(f"  ✓ {msg}"))
+
+
+def ui_warn(msg: str) -> None:
+    print(yellow(f"  ! {msg}"))
+
+
+def ui_info(msg: str) -> None:
+    print(dim(f"  · {msg}"))
+
+
+def ui_err(msg: str) -> None:
+    print(red(f"  ✗ {msg}"))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Query Lightwell catalog via content-sources API "
+            "(package / version counts and listings)."
+        )
+    )
+    parser.add_argument(
+        "command",
+        choices=("summary", "packages", "versions", "advisories", "doctor"),
+        help=(
+            "summary = counts by ecosystem×security_level; "
+            "packages / versions = list rows; "
+            "advisories = security advisories; "
+            "doctor = diagnose auth (JWT claims + probe endpoints)"
+        ),
+    )
+    parser.add_argument(
+        "--client-id",
+        default=os.environ.get("RH_CLIENT_ID") or os.environ.get("CLIENT_ID"),
+        help="Hybrid Console SA client id. Env: RH_CLIENT_ID or CLIENT_ID",
+    )
+    parser.add_argument(
+        "--client-secret",
+        default=os.environ.get("RH_CLIENT_SECRET") or os.environ.get("CLIENT_SECRET"),
+        help="Hybrid Console SA client secret. Env: RH_CLIENT_SECRET or CLIENT_SECRET",
+    )
+    parser.add_argument(
+        "--token",
+        default=(
+            os.environ.get("LW_API_TOKEN")
+            or os.environ.get("ACCESS_TOKEN")
+            or os.environ.get("TOKEN")
+        ),
+        help=(
+            "Existing Bearer access_token from SSO (skips client_credentials). "
+            "Env: LW_API_TOKEN, ACCESS_TOKEN, or TOKEN — must NOT be the registry LW_TOKEN"
+        ),
+    )
+    parser.add_argument(
+        "--ecosystem",
+        choices=ECOSYSTEMS,
+        default=None,
+        help="Filter: maven | python | npm",
+    )
+    parser.add_argument(
+        "--security-level",
+        choices=SECURITY_LEVELS,
+        default=None,
+        help="Filter: validated | remediated",
+    )
+    parser.add_argument(
+        "--name",
+        default="",
+        help="Substring filter on package name",
+    )
+    parser.add_argument(
+        "--search",
+        default="",
+        help="Broader search (packages endpoint: name/group/scope)",
+    )
+    parser.add_argument(
+        "--repository",
+        default="",
+        help="Filter by repository name",
+    )
+    parser.add_argument(
+        "--severity-min",
+        default="",
+        help="Advisories only: minimum severity (e.g. Important)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Page size for list commands (default: 50)",
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Offset for list commands (default: 0)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print raw JSON response instead of a table",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Request demo catalog (API demo=true)",
+    )
+    return parser.parse_args()
+
+
+def decode_jwt_claims(token: str) -> dict[str, Any]:
+    """Decode JWT payload without verifying signature (diagnostic only)."""
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    padded = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def summarize_claims(claims: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "iss",
+        "aud",
+        "azp",
+        "scope",
+        "scp",
+        "typ",
+        "preferred_username",
+        "client_id",
+        "username",
+        "account_number",
+        "account_id",
+        "org_id",
+        "is_org_admin",
+        "is_service_account",
+    )
+    out: dict[str, Any] = {}
+    for key in keys:
+        if key in claims and claims[key] is not None:
+            out[key] = claims[key]
+    return out
+
+
+def request_sso_token(client_id: str, client_secret: str, scope: str) -> tuple[str, int]:
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": scope,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        SSO_TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "lightwell-catalog-api/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise SystemExit(
+            f"SSO token request failed for scope={scope!r}: HTTP {exc.code}\n{detail}\n"
+            "Use a Hybrid Console service account (Settings → Service Accounts), "
+            "not the registry XXXXXXX|name credentials."
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"SSO token request failed: {exc.reason}") from exc
+
+    token = payload.get("access_token")
+    if not isinstance(token, str) or not token:
+        raise SystemExit(f"SSO response missing access_token: {payload!r}")
+    expires = payload.get("expires_in")
+    expires_i = int(expires) if isinstance(expires, int) else 0
+    return token, expires_i
+
+
+def http_status(url: str, token: str) -> tuple[int, str]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "lightwell-catalog-api/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read().decode("utf-8", errors="replace")[:200]
+            return int(response.status), body
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:200]
+        return int(exc.code), body
+    except urllib.error.URLError as exc:
+        return 0, str(exc.reason)
+
+
+def probe_console_accepts_token(token: str) -> tuple[bool, list[tuple[str, int]]]:
+    """True if at least one console probe returns something other than 401."""
+    results: list[tuple[str, int]] = []
+    accepted = False
+    for path in AUTH_PROBE_PATHS:
+        code, _ = http_status(f"{CONSOLE_ORIGIN}{path}", token)
+        results.append((path, code))
+        if code and code != 401:
+            accepted = True
+    return accepted, results
+
+
+def warn_if_registry_shaped_client_id(client_id: str) -> None:
+    if "|" in client_id:
+        ui_warn(
+            f"RH_CLIENT_ID contains '|' ({client_id[:24]}…) — that looks like a "
+            "registry SA (XXXXXXX|name), not a Hybrid Console service account."
+        )
+        ui_warn(
+            "Create one at console.redhat.com → Settings (gear) → Service Accounts."
+        )
+
+
+def fetch_bearer_token(client_id: str, client_secret: str) -> str:
+    warn_if_registry_shaped_client_id(client_id)
+    last_token = ""
+    last_scope = ""
+    for scope in TOKEN_SCOPES:
+        ui_info(f"SSO client_credentials scope={scope!r}")
+        token, expires = request_sso_token(client_id, client_secret, scope)
+        last_token, last_scope = token, scope
+        claims = summarize_claims(decode_jwt_claims(token))
+        scope_claim = claims.get("scope") or claims.get("scp") or "?"
+        ui_ok(f"token ok (expires_in≈{expires}s, jwt.scope={scope_claim!r})")
+        accepted, probes = probe_console_accepts_token(token)
+        for path, code in probes:
+            label = green(str(code)) if code and code != 401 else red(str(code) or "err")
+            ui_info(f"probe HTTP {label}  {path}")
+        if accepted:
+            ui_ok(f"console accepted JWT for scope={scope!r}")
+            return token
+        ui_warn(f"console still returns 401 for scope={scope!r}; trying next…")
+
+    _ = last_token  # retained for clearer exit text via last_scope
+    raise SystemExit(
+        "All scopes minted a token, but console.redhat.com returned 401 for each "
+        f"(last scope={last_scope!r}).\n"
+        "Run: python3 lightwell_catalog_api.py doctor\n"
+        "Confirm RH_CLIENT_ID/SECRET are from Hybrid Console → Settings → "
+        "Service Accounts (not Terms-based Registry), then add Repositories viewer."
+    )
+
+
+def resolve_token(args: argparse.Namespace) -> str:
+    if args.token:
+        ui_info("using Bearer token from --token / $LW_API_TOKEN")
+        return args.token.strip()
+    if args.client_id and args.client_secret:
+        ui_info("fetching Bearer token via RH_CLIENT_ID / RH_CLIENT_SECRET")
+        return fetch_bearer_token(args.client_id.strip(), args.client_secret.strip())
+    raise SystemExit(
+        "Catalog API auth required.\n"
+        "Option A — Hybrid Console service account:\n"
+        "  export RH_CLIENT_ID='...'\n"
+        "  export RH_CLIENT_SECRET='...'\n"
+        "Option B — short-lived token (~15 min):\n"
+        "  export LW_API_TOKEN='...'\n"
+        "\n"
+        "This is different from the registry SA used by the download script "
+        "(XXXXXXX|name + LW_TOKEN).\n"
+        "Diagnose with: python3 lightwell_catalog_api.py doctor"
+    )
+
+
+def api_get(path: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
+    query = {k: v for k, v in params.items() if v is not None and v != ""}
+    url = f"{API_BASE}{path}"
+    if query:
+        url = f"{url}?{urllib.parse.urlencode(query)}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "lightwell-catalog-api/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:800]
+        hint = ""
+        if exc.code == 401:
+            hint = (
+                "\n401 usually means the token is not accepted by console.redhat.com.\n"
+                "Check: (1) SSO scope is api.console; (2) credentials are a Hybrid "
+                "Console service account (not registry XXXXXXX|name); "
+                "(3) the SA is in a User Access group with Repositories viewer."
+            )
+        elif exc.code == 403:
+            hint = (
+                "\n403: authenticated but forbidden — add Repositories viewer "
+                "to the service account's User Access group, then fetch a fresh token."
+            )
+        elif exc.code == 428:
+            hint = "\nLightwell terms may need to be accepted in the console."
+        raise SystemExit(f"API HTTP {exc.code} for {url}\n{detail}{hint}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"Failed to reach {url}: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON from {url}: {exc}") from exc
+
+
+def meta_count(payload: dict[str, Any]) -> int | None:
+    meta = payload.get("meta")
+    if isinstance(meta, dict) and isinstance(meta.get("count"), int):
+        return meta["count"]
+    return None
+
+
+def build_list_params(args: argparse.Namespace) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "limit": args.limit,
+        "offset": args.offset,
+    }
+    if args.ecosystem:
+        params["ecosystem"] = args.ecosystem
+    if args.security_level:
+        params["security_level"] = args.security_level
+    if args.name:
+        params["name"] = args.name
+    if args.search:
+        params["search"] = args.search
+    if args.repository:
+        params["repository"] = args.repository
+    if args.demo:
+        params["demo"] = "true"
+    return params
+
+
+def cmd_summary(token: str, args: argparse.Namespace) -> int:
+    """Print package and version counts from meta.count (limit=1 probes)."""
+    ecosystems = (args.ecosystem,) if args.ecosystem else ECOSYSTEMS
+    levels = (args.security_level,) if args.security_level else SECURITY_LEVELS
+
+    ui_step("Catalog summary (meta.count)")
+    ui_info("Source: GET /lightwell/packages and /lightwell/package_versions")
+    print()
+    header = f"{'ecosystem':<10} {'level':<12} {'packages':>10} {'versions':>10}"
+    print(bold(header))
+    print(dim("-" * len(header)))
+
+    total_packages = 0
+    total_versions = 0
+    for ecosystem in ecosystems:
+        for level in levels:
+            base = {
+                "ecosystem": ecosystem,
+                "security_level": level,
+                "limit": 1,
+                "offset": 0,
+            }
+            if args.name:
+                base["name"] = args.name
+            if args.search:
+                base["search"] = args.search
+            if args.repository:
+                base["repository"] = args.repository
+            if args.demo:
+                base["demo"] = "true"
+
+            packages = api_get("/lightwell/packages", token, base)
+            versions = api_get("/lightwell/package_versions", token, base)
+            pcount = meta_count(packages)
+            vcount = meta_count(versions)
+            if pcount is None or vcount is None:
+                ui_warn(f"{ecosystem}/{level}: response missing meta.count")
+                print(f"{ecosystem:<10} {level:<12} {'?':>10} {'?':>10}")
+                continue
+            total_packages += pcount
+            total_versions += vcount
+            print(f"{ecosystem:<10} {level:<12} {pcount:>10,} {vcount:>10,}")
+
+    print(dim("-" * len(header)))
+    print(f"{'TOTAL':<10} {'(listed)':<12} {total_packages:>10,} {total_versions:>10,}")
+    print()
+    ui_info(
+        "These are catalog package/version counts (Lens-style), not file counts "
+        "(.jar/.pom/-sources) and not disk bytes."
+    )
+    return 0
+
+
+def print_package_rows(payload: dict[str, Any]) -> None:
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        ui_warn("no data[] in response")
+        return
+    count = meta_count(payload)
+    ui_ok(f"showing {len(rows)} package(s)" + (f" of {count:,} total" if count is not None else ""))
+    print()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        eco = row.get("ecosystem", "?")
+        group = row.get("group") or ""
+        name = row.get("name", "?")
+        repo = row.get("repository", "")
+        versions = row.get("versions") if isinstance(row.get("versions"), list) else []
+        label = f"{group}:{name}" if group else str(name)
+        print(f"  {cyan(str(eco)):<18} {bold(label)}")
+        ui_info(f"repository={repo}  versions={len(versions)}")
+        if versions:
+            preview = ", ".join(str(v) for v in versions[:5])
+            if len(versions) > 5:
+                preview += ", …"
+            ui_info(preview)
+
+
+def print_version_rows(payload: dict[str, Any]) -> None:
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        ui_warn("no data[] in response")
+        return
+    count = meta_count(payload)
+    ui_ok(f"showing {len(rows)} version(s)" + (f" of {count:,} total" if count is not None else ""))
+    print()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        eco = row.get("ecosystem", "?")
+        coords = row.get("coordinates") or row.get("purl") or row.get("name")
+        version = row.get("version", "")
+        repo = row.get("repository", "")
+        print(f"  {cyan(str(eco)):<18} {bold(str(coords))}  {green(str(version))}")
+        ui_info(f"repository={repo}")
+
+
+def print_advisory_rows(payload: dict[str, Any]) -> None:
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        ui_warn(f"unexpected advisory shape keys={list(payload)}")
+        print(json.dumps(payload, indent=2)[:4000])
+        return
+    count = meta_count(payload)
+    ui_ok(f"showing {len(rows)} advisory row(s)" + (f" of {count:,} total" if count is not None else ""))
+    print()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        advisory_id = row.get("advisory_id") or row.get("id") or "?"
+        severity = row.get("severity") or row.get("severity_name") or ""
+        title = row.get("title") or row.get("synopsis") or row.get("details") or ""
+        print(f"  {bold(str(advisory_id))}  {yellow(str(severity))}")
+        if title:
+            ui_info(str(title)[:160])
+
+
+def cmd_packages(token: str, args: argparse.Namespace) -> int:
+    ui_step("List packages")
+    payload = api_get("/lightwell/packages", token, build_list_params(args))
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    print_package_rows(payload)
+    return 0
+
+
+def cmd_versions(token: str, args: argparse.Namespace) -> int:
+    ui_step("List package versions")
+    params = build_list_params(args)
+    # versions endpoint has no "search" in OpenAPI — drop if empty already handled
+    params.pop("search", None)
+    payload = api_get("/lightwell/package_versions", token, params)
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    print_version_rows(payload)
+    return 0
+
+
+def cmd_advisories(token: str, args: argparse.Namespace) -> int:
+    ui_step("List advisories")
+    params: dict[str, Any] = {
+        "limit": args.limit,
+        "offset": args.offset,
+    }
+    if args.severity_min:
+        params["severity_min"] = args.severity_min
+    payload = api_get("/lightwell/advisories", token, params)
+    # OpenAPI also documents /advisories at root in docs curl — try lightwell path first.
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    print_advisory_rows(payload)
+    return 0
+
+
+def _looks_like_jwt(token: str) -> bool:
+    parts = token.split(".")
+    return len(parts) == 3 and all(parts)
+
+
+def _token_env_sanity() -> None:
+    """Warn if $TOKEN / $LW_TOKEN look swapped (Get Started checklist)."""
+    raw_token = (os.environ.get("TOKEN") or "").strip()
+    lw_token = (os.environ.get("LW_TOKEN") or "").strip()
+    lw_user = (os.environ.get("LW_USER") or "").strip()
+
+    ui_step("1) What does $TOKEN hold?")
+    if raw_token:
+        if "|" in raw_token or (lw_user and raw_token == lw_user):
+            ui_err("$TOKEN looks like a registry username/token — not an SSO Bearer JWT")
+        elif _looks_like_jwt(raw_token):
+            ui_ok(f"$TOKEN is set and looks like a JWT (len={len(raw_token)})")
+        else:
+            ui_warn(
+                f"$TOKEN is set (len={len(raw_token)}) but does not look like a JWT "
+                "(3 base64 segments). It may be the registry LW_TOKEN by mistake."
+            )
+    else:
+        ui_info("$TOKEN unset — will use RH_CLIENT_ID/SECRET or LW_API_TOKEN if present")
+
+    if lw_token and raw_token and lw_token == raw_token:
+        ui_err(
+            "$TOKEN == $LW_TOKEN — registry token is NOT valid as "
+            "Authorization: Bearer for console.redhat.com/api"
+        )
+    if lw_user and "|" in lw_user:
+        ui_info(
+            f"$LW_USER looks like registry SA ({lw_user[:16]}…) — OK for "
+            "packages.redhat.com Basic Auth only"
+        )
+
+
+def _probe_registry_membership() -> None:
+    """Separate check: org Lightwell entitlement via registry Basic Auth."""
+    ui_step("4) Registry membership (Basic Auth — separate from API Bearer)")
+    user = (os.environ.get("LW_USER") or "").strip()
+    token = (os.environ.get("LW_TOKEN") or "").strip()
+    if not user or not token:
+        ui_info("skip — set LW_USER + LW_TOKEN to verify packages.redhat.com entitlement")
+        return
+    basic = "Basic " + base64.b64encode(f"{user}:{token}".encode("utf-8")).decode(
+        "ascii"
+    )
+    request = urllib.request.Request(
+        REGISTRY_MEMBERSHIP_URL,
+        headers={
+            "Authorization": basic,
+            "User-Agent": "lightwell-catalog-api/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            code = int(response.status)
+    except urllib.error.HTTPError as exc:
+        code = int(exc.code)
+    except urllib.error.URLError as exc:
+        ui_err(f"registry unreachable: {exc.reason}")
+        return
+    if code == 200:
+        ui_ok(
+            f"HTTP {code}  packages.redhat.com …/woodstox-core/maven-metadata.xml"
+        )
+        ui_info(
+            "Lightwell membership/entitlement looks fine — API 401s are Hybrid "
+            "Console SA / Bearer setup only"
+        )
+    elif code in {401, 403}:
+        ui_err(f"HTTP {code}  registry Basic Auth failed — check LW_USER/LW_TOKEN")
+    else:
+        ui_warn(f"HTTP {code}  {REGISTRY_MEMBERSHIP_URL}")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Get Started checklist: Hybrid Console SA → SSO token → lightwell/repositories."""
+    ui_step("Auth doctor (Get Started: Lightwell Network API access)")
+    ui_info(
+        "API needs Hybrid Console SA (console.redhat.com → Settings → Service Accounts)"
+    )
+    ui_info(
+        "Registry SA (1234567|name) is Basic Auth for packages.redhat.com only — "
+        "its token is NOT a console Bearer"
+    )
+
+    _token_env_sanity()
+
+    client_id = (args.client_id or "").strip()
+    client_secret = (args.client_secret or "").strip()
+
+    ui_step("2) Does the SSO token request work?")
+    tokens: list[tuple[str, str]] = []
+    if args.token:
+        tok = args.token.strip()
+        if not _looks_like_jwt(tok):
+            ui_err(
+                "Supplied --token / $TOKEN does not look like an SSO access_token JWT"
+            )
+        else:
+            ui_ok("using pre-supplied Bearer JWT (skipping client_credentials)")
+            tokens = [("pre-supplied $TOKEN / LW_API_TOKEN / --token", tok)]
+    elif client_id and client_secret:
+        warn_if_registry_shaped_client_id(client_id)
+        ui_info(f"client_id length={len(client_id)}  prefix={client_id[:12]!r}…")
+        for scope in TOKEN_SCOPES:
+            try:
+                tok, expires = request_sso_token(client_id, client_secret, scope)
+            except SystemExit as exc:
+                ui_err(str(exc))
+                continue
+            # Equivalent to: curl … | jq 'keys'  → expect access_token, expires_in
+            ui_ok(
+                f"SSO keys ok for scope={scope!r} "
+                f"(access_token + expires_in≈{expires}s)"
+            )
+            tokens.append((f"scope={scope!r} expires≈{expires}s", tok))
+        if not tokens:
+            ui_err(
+                "SSO returned error — client ID or secret is wrong "
+                "(or not a Hybrid Console service account)"
+            )
+            _probe_registry_membership()
+            return 1
+    else:
+        ui_err(
+            "Set Hybrid Console CLIENT_ID/CLIENT_SECRET (or RH_CLIENT_ID/SECRET), "
+            "or a Bearer TOKEN from SSO"
+        )
+        _probe_registry_membership()
+        return 1
+
+    ui_step("3) Sanity: GET /lightwell/repositories/ with Bearer")
+    any_ok = False
+    for label, token in tokens:
+        print()
+        print(bold(f"· {label}"))
+        claims = summarize_claims(decode_jwt_claims(token))
+        if not claims:
+            ui_warn("could not decode JWT payload")
+        else:
+            print(dim(json.dumps(claims, indent=2)))
+            scope_claim = str(claims.get("scope") or claims.get("scp") or "")
+            if "api.console" not in scope_claim and label.startswith("scope="):
+                ui_warn(
+                    "jwt.scope does not include api.console — console may return 401"
+                )
+        accepted, probes = probe_console_accepts_token(token)
+        for path, code in probes:
+            if code == 401:
+                ui_err(f"HTTP {code}  {path}")
+            elif code in {200, 204}:
+                ui_ok(f"HTTP {code}  {path}")
+            elif code == 403:
+                ui_warn(f"HTTP {code}  {path}  (auth ok; missing Repositories viewer?)")
+            else:
+                ui_info(f"HTTP {code}  {path}")
+        if accepted:
+            any_ok = True
+            if any(c == 403 for _, c in probes):
+                ui_warn(
+                    "Token accepted but forbidden — add Repositories viewer to the "
+                    "SA's User Access group, then mint a fresh token."
+                )
+            else:
+                ui_ok("Console accepts this token — try: summary")
+            break
+
+    _probe_registry_membership()
+
+    print()
+    if any_ok:
+        return 0
+    ui_err("No token was accepted by console.redhat.com (all probes 401).")
+    print(
+        dim(
+            """
+Get Started checklist:
+  1. Create SA at console.redhat.com → Settings → Service Accounts
+     (NOT Terms-based Registry; username 1234567|name will not work as CLIENT_ID)
+  2. Add SA to a User Access group with Repositories viewer
+  3. export CLIENT_ID=… CLIENT_SECRET=…   # or RH_CLIENT_ID / RH_CLIENT_SECRET
+  4. TOKEN=$(curl -s …/token -d grant_type=client_credentials \\
+         -d client_id="$CLIENT_ID" -d client_secret="$CLIENT_SECRET" \\
+         -d scope=api.console | jq -r .access_token)
+     # Confirm: echo "$TOKEN" | cut -c1-20   → should look like eyJ… (JWT), not a registry secret
+  5. curl -s 'https://console.redhat.com/api/content-sources/v1.0/lightwell/repositories/' \\
+         -H "Authorization: Bearer $TOKEN" | jq . | head -40
+
+If step 4 works but step 5 is 401: wrong token in $TOKEN, or SA not from this org.
+If registry membership (step 4 in doctor) is 200: Lightwell entitlement is fine —
+only Hybrid Console API setup remains.
+"""
+        )
+    )
+    return 1
+
+
+def main() -> int:
+    args = parse_args()
+    print()
+    print(bold(cyan("Lightwell catalog API")))
+    print(dim("content-sources · Bearer auth · catalog counts / listings"))
+    print()
+    ui_warn("Unofficial helper — not an officially supported Red Hat tool")
+
+    if args.command == "doctor":
+        return cmd_doctor(args)
+
+    token = resolve_token(args)
+
+    if args.command == "summary":
+        return cmd_summary(token, args)
+    if args.command == "packages":
+        return cmd_packages(token, args)
+    if args.command == "versions":
+        return cmd_versions(token, args)
+    if args.command == "advisories":
+        return cmd_advisories(token, args)
+    raise SystemExit(f"Unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print()
+        print(yellow("Cancelled."))
+        raise SystemExit(130)

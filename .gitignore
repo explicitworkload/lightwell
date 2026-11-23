@@ -19,3 +19,5 @@ venv/
 *.swp
 .idea/
 .vscode/
+
+*jg-sbom.json
