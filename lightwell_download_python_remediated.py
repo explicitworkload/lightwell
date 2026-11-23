@@ -183,6 +183,7 @@ def attestation_summary_lines(bundle_path: Path) -> list[str]:
 def print_download_summary(
     *,
     artifact: Path | None = None,
+    pom: Path | None = None,
     attestation: Path | None = None,
     notes: list[str] | None = None,
 ) -> None:
@@ -190,6 +191,8 @@ def print_download_summary(
     print(bold("── Summary ──"))
     if artifact and artifact.is_file():
         print(f"  {file_line(artifact, 'Artifact')}")
+    if pom and pom.is_file():
+        print(f"  {file_line(pom, 'POM')}")
     if attestation and attestation.is_file():
         print(f"  {file_line(attestation, 'Attestation')}")
         for line in attestation_summary_lines(attestation):
@@ -197,7 +200,7 @@ def print_download_summary(
     if notes:
         for note in notes:
             ui_info(note)
-    if not artifact and not attestation and not notes:
+    if not artifact and not pom and not attestation and not notes:
         ui_info("nothing saved")
     print()
 
@@ -322,7 +325,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default="download",
-        help="Directory to save the downloaded file (default: download/)",
+        help=(
+            "Root directory for downloads (default: download/). "
+            "By default files keep the remote path (Maven / PyPI / npm layout) "
+            "so the tree can be tarballed for airgapped use."
+        ),
+    )
+    parser.add_argument(
+        "--flat",
+        action="store_true",
+        help="Save only basenames under --output-dir (legacy flat layout)",
     )
     parser.add_argument(
         "--filter",
@@ -700,6 +712,52 @@ def is_classifier_jar(jar_name: str) -> bool:
     return jar_stem_without_classifier(stem) != stem
 
 
+def pom_name_for_main_jar(jar_name: str) -> str | None:
+    """Sibling POM for a main jar (not classifier jars)."""
+    if not jar_name.lower().endswith(".jar"):
+        return None
+    if is_classifier_jar(jar_name):
+        return None
+    return jar_name[: -len(".jar")] + ".pom"
+
+
+def fetch_sibling_pom(
+    artifact_name: str,
+    artifact_url: str,
+    jar_dest: Path,
+    user: str,
+    token: str,
+    output_dir: Path,
+    *,
+    flat: bool = False,
+) -> Path | None:
+    """Auto-download the Maven .pom next to a main jar (needed for repo resolution)."""
+    pom_name = pom_name_for_main_jar(artifact_name)
+    if not pom_name:
+        return None
+
+    local_pom = jar_dest.with_name(pom_name)
+    if local_pom.is_file():
+        ui_ok(f"POM already present: {local_pom.name}")
+        return local_pom
+
+    pom_url = urllib.parse.urljoin(artifact_url, pom_name)
+    ui_step("Fetch sibling POM")
+    downloaded = download_file(
+        pom_url,
+        user,
+        token,
+        output_dir,
+        optional=True,
+        flat=flat,
+        dest_path=local_pom,
+    )
+    if downloaded is None:
+        ui_warn(f"no sibling POM published ({pom_name})")
+        return None
+    return downloaded
+
+
 def looks_like_directory(name: str, url: str) -> bool:
     if url.endswith("/"):
         return True
@@ -754,6 +812,42 @@ def list_java_entries(
     return directories, artifacts, provenance
 
 
+def mirror_dest_for_url(
+    url: str,
+    output_dir: Path,
+    *,
+    filename: str | None = None,
+    flat: bool = False,
+    dest_path: Path | None = None,
+) -> Path:
+    """Map a remote artifact URL to a local path under output_dir.
+
+    Default (flat=False): preserve the URL path so Maven/PyPI/npm trees stay
+    mirrorable, e.g.
+      …/lightwell/java/validated/com/foo/bar/1.0/bar-1.0.jar
+        → download/lightwell/java/validated/com/foo/bar/1.0/bar-1.0.jar
+    """
+    if dest_path is not None:
+        return dest_path
+
+    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path)
+    basename = path.rstrip("/").rsplit("/", 1)[-1] if path else ""
+    name = filename or basename
+    if not name or name in {".", "..", "provenance"}:
+        raise SystemExit(f"Could not derive filename from URL: {url}")
+
+    if flat:
+        return output_dir / name
+
+    rel = path.lstrip("/")
+    if not rel:
+        return output_dir / name
+    dest = output_dir / rel
+    if filename:
+        dest = dest.with_name(filename)
+    return dest
+
+
 def download_file(
     url: str,
     user: str,
@@ -762,15 +856,17 @@ def download_file(
     *,
     optional: bool = False,
     filename: str | None = None,
+    flat: bool = False,
+    dest_path: Path | None = None,
 ) -> Path | None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if not filename:
-        filename = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1])
-    if not filename or filename in {".", "..", "provenance"}:
-        raise SystemExit(f"Could not derive filename from URL: {url}")
-    dest = output_dir / filename
+    dest = mirror_dest_for_url(
+        url, output_dir, filename=filename, flat=flat, dest_path=dest_path
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    display_name = dest.name
 
-    print(f"  {cyan('↓')} {bold(filename)}  {dim(url)}")
+    print(f"  {cyan('↓')} {bold(display_name)}  {dim(url)}")
+    ui_info(f"→ {dest}")
     try:
         with open_url(url, user, token, timeout=120) as response, open(dest, "wb") as out:
             total_hdr = response.headers.get("Content-Length")
@@ -794,7 +890,7 @@ def download_file(
     except urllib.error.HTTPError as exc:
         body = _read_http_error(exc)
         if optional and exc.code == 404:
-            ui_warn(f"not found: {filename}")
+            ui_warn(f"not found: {display_name}")
             return None
         if exc.code in {401, 403}:
             raise SystemExit(auth_error_hint(exc.code, url, body)) from exc
@@ -1032,6 +1128,8 @@ def handle_java_provenance(
     user: str,
     token: str,
     output_dir: Path,
+    *,
+    flat: bool = False,
 ) -> Path | None:
     """After downloading a main jar, fetch its provenance; skip classifier jars."""
     if not artifact_name.lower().endswith(".jar"):
@@ -1051,12 +1149,21 @@ def handle_java_provenance(
     if not prov_name or not prov_url:
         return None
 
-    local_bundle = output_dir / prov_name
+    # Keep attestation beside the jar (Maven layout or flat).
+    local_bundle = jar_dest.with_name(prov_name)
     if local_bundle.is_file():
         ui_ok(f"attestation already present: {local_bundle.name}")
     else:
         ui_step("Fetch attestation (main jar)")
-        downloaded = download_file(prov_url, user, token, output_dir, optional=True)
+        downloaded = download_file(
+            prov_url,
+            user,
+            token,
+            output_dir,
+            optional=True,
+            flat=flat,
+            dest_path=local_bundle,
+        )
         if downloaded is None:
             ui_warn("no provenance published for this main artifact on this tier")
             return None
@@ -1138,6 +1245,8 @@ def handle_python_provenance(
     user: str,
     token: str,
     output_dir: Path,
+    *,
+    flat: bool = False,
 ) -> Path | None:
     """After downloading a wheel, always try to fetch PEP 740 provenance; then offer view/verify."""
     if not artifact_name.lower().endswith(".whl"):
@@ -1155,7 +1264,8 @@ def handle_python_provenance(
 
     prov_name = artifact_name + PYTHON_PROVENANCE_SUFFIX
     prov_url = python_provenance_url(repository, package_name, version, artifact_name)
-    local_prov = output_dir / prov_name
+    # Integrity API URL is not under the wheel tree — place sibling next to the wheel.
+    local_prov = wheel_dest.with_name(prov_name)
 
     if local_prov.is_file():
         ui_ok(f"attestation already present: {local_prov.name}")
@@ -1165,7 +1275,14 @@ def handle_python_provenance(
             f"{normalize_python_package_name(package_name)} @ {version} · {repository}"
         )
         downloaded = download_file(
-            prov_url, user, token, output_dir, optional=True, filename=prov_name
+            prov_url,
+            user,
+            token,
+            output_dir,
+            optional=True,
+            filename=prov_name,
+            flat=flat,
+            dest_path=local_prov,
         )
         if downloaded is None:
             ui_warn("no provenance published for this wheel (or Integrity API path mismatch)")
@@ -1366,7 +1483,13 @@ def select_repo(args: argparse.Namespace) -> tuple[str, str, str]:
 
 
 def run_python_flow(
-    index_url: str, user: str, token: str, output_dir: Path, name_filter: str
+    index_url: str,
+    user: str,
+    token: str,
+    output_dir: Path,
+    name_filter: str,
+    *,
+    flat: bool = False,
 ) -> int:
     ui_step("Load package list")
     packages = list_python_packages(index_url, user, token, name_filter)
@@ -1399,11 +1522,11 @@ def run_python_flow(
         return 0
 
     ui_step("Download")
-    dest = download_file(artifact_url, user, token, output_dir)
+    dest = download_file(artifact_url, user, token, output_dir, flat=flat)
     if dest is None:
         raise SystemExit("Download failed.")
     attest = handle_python_provenance(
-        package_name, artifact_name, index_url, dest, user, token, output_dir
+        package_name, artifact_name, index_url, dest, user, token, output_dir, flat=flat
     )
     print_download_summary(artifact=dest, attestation=attest)
     return 0
@@ -1421,7 +1544,14 @@ def parent_url(url: str, root_url: str) -> str | None:
     return parent
 
 
-def run_java_flow(root_url: str, user: str, token: str, output_dir: Path) -> int:
+def run_java_flow(
+    root_url: str,
+    user: str,
+    token: str,
+    output_dir: Path,
+    *,
+    flat: bool = False,
+) -> int:
     """Walk Maven directory listings until an artifact is chosen."""
     current = root_url
     while True:
@@ -1471,7 +1601,7 @@ def run_java_flow(root_url: str, user: str, token: str, output_dir: Path) -> int
             continue
 
         ui_step("Download")
-        dest = download_file(chosen_url, user, token, output_dir)
+        dest = download_file(chosen_url, user, token, output_dir, flat=flat)
         if dest is None:
             continue
 
@@ -1489,12 +1619,17 @@ def run_java_flow(root_url: str, user: str, token: str, output_dir: Path) -> int
                     verify_java_provenance(jar_guess, dest)
             print_download_summary(attestation=dest)
         else:
+            pom_dest = fetch_sibling_pom(
+                artifact_name, chosen_url, dest, user, token, output_dir, flat=flat
+            )
             attest = handle_java_provenance(
-                artifact_name, chosen_url, dest, user, token, output_dir
+                artifact_name, chosen_url, dest, user, token, output_dir, flat=flat
             )
             if is_classifier_jar(artifact_name):
                 notes.append("classifier jar — attestation only exists for the main jar")
-            print_download_summary(artifact=dest, attestation=attest, notes=notes)
+            print_download_summary(
+                artifact=dest, pom=pom_dest, attestation=attest, notes=notes
+            )
 
         again = input(dim("  Download another from this repo? [y/N]: ")).strip().lower()
         if again in {"y", "yes"}:
@@ -1503,7 +1638,13 @@ def run_java_flow(root_url: str, user: str, token: str, output_dir: Path) -> int
 
 
 def run_javascript_flow(
-    registry_url: str, user: str, token: str, output_dir: Path, name_filter: str
+    registry_url: str,
+    user: str,
+    token: str,
+    output_dir: Path,
+    name_filter: str,
+    *,
+    flat: bool = False,
 ) -> int:
     """Browse npm registry: list/search packages → versions → download tarball."""
     ui_step("Load npm packages")
@@ -1541,7 +1682,7 @@ def run_javascript_flow(
         return 0
 
     ui_step("Download")
-    dest = download_file(tarball_url, user, token, output_dir)
+    dest = download_file(tarball_url, user, token, output_dir, flat=flat)
     if dest is None:
         raise SystemExit("Download failed.")
     print_download_summary(artifact=dest)
@@ -1861,12 +2002,20 @@ def main() -> int:
     ui_info(index_url)
     ui_info(f"user {user}")
     ui_info(f"output {output_dir.resolve()}")
+    if args.flat:
+        ui_info("layout: flat (basenames only under output-dir)")
+    else:
+        ui_info("layout: mirror remote paths (Maven / PyPI / npm) under output-dir")
 
     if kind == "python":
-        return run_python_flow(index_url, user, token, output_dir, args.filter)
+        return run_python_flow(
+            index_url, user, token, output_dir, args.filter, flat=args.flat
+        )
     if kind == "javascript":
-        return run_javascript_flow(index_url, user, token, output_dir, args.filter)
-    return run_java_flow(index_url, user, token, output_dir)
+        return run_javascript_flow(
+            index_url, user, token, output_dir, args.filter, flat=args.flat
+        )
+    return run_java_flow(index_url, user, token, output_dir, flat=args.flat)
 
 
 if __name__ == "__main__":

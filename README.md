@@ -39,7 +39,7 @@ For integrations that need “which CVEs did Lightwell remediate for package X?�
 |---|---|
 | **Interactive browse & download** | Walk Python / Java / JavaScript Lightwell registries with Basic Auth; you pick what to open and download |
 | **Repo presets** | Validated + Remediated for Python & Java; JavaScript Validated (Technology Preview) |
-| **Auto provenance (Java)** | After each **main** `.jar` download, fetch `<artifact>-<version>.provenance.sigstore.json` when published |
+| **Auto POM + provenance (Java)** | After each **main** `.jar` download, fetch sibling `.pom` and `<artifact>-<version>.provenance.sigstore.json` when published |
 | **Auto provenance (Python)** | After each `.whl` download, fetch PEP 740 provenance via the Pulp Integrity API (`<wheel>.provenance.json`) |
 | **View / verify attestation** | Compact attestation summary; optional full JSON; `cosign` verify (PNC key 1 for Java, RELEASE3 for Python) |
 | **Size estimate** | `--estimate-size`: HEAD-only `Content-Length` sample with `--filter` and `--max-artifacts` cap (not a full-catalog mirror) |
@@ -95,7 +95,7 @@ Credentials can also be passed with `--user` / `--token`, or entered when prompt
 python3 lightwell_download_python_remediated.py
 ```
 
-You will be prompted to pick a repository, then browse packages/artifacts. Files are saved under `download/` by default.
+You will be prompted to pick a repository, then browse packages/artifacts. By default files keep the **remote path layout** under `download/` (Maven group/artifact/version, PyPI package paths, npm tarball paths) so you can tarball the tree for an airgapped mirror. Use `--flat` for the old basename-only layout.
 
 After each download the UI prints a **Summary** with path/size and, when present, attestation notes (predicate type, subjects, builder).
 
@@ -114,19 +114,37 @@ python3 lightwell_download_python_remediated.py \
   --index-url 'https://packages.redhat.com/lightwell/python/predisclosure/simple/' \
   --kind python
 
-# Custom output directory
+# Custom output root (still mirrors remote paths underneath)
 python3 lightwell_download_python_remediated.py --repo java-remediated --output-dir ./artifacts
+
+# Legacy flat layout (basenames only)
+python3 lightwell_download_python_remediated.py --repo java-remediated --flat
+```
+
+Example mirrored paths:
+
+```text
+download/lightwell/java/validated/com/fasterxml/jackson/core/jackson-databind/2.15.0/….jar
+download/lightwell/python/remediated/…/requests-….whl
+```
+
+Pack for airgap:
+
+```bash
+tar czf lightwell-mirror.tgz -C download lightwell
+# On the airgapped host: extract and point Maven/pip/npm (or Artifactory/Nexus) at the tree
 ```
 
 While browsing lists: `/text` to filter further, `q` to quit. `--kind` is optional for `--index-url` (guessed from `/python/`, `/java/`, or `/javascript/`).
 
 ### Provenance (auto-fetch + view / verify)
 
-**Java** — On each **main** `.jar` download, automatically fetches  
+**Java** — On each **main** `.jar` download, automatically fetches the sibling  
+`<artifactId>-<version>.pom` (for Maven resolution) and  
 `<artifactId>-<version>.provenance.sigstore.json` when published. Verify with embedded  
 [PNC Provenance Signing Key 1](https://docs.redhat.com/en/documentation/lightwell_network/current/configure-verify_provenance_for_java_artifacts).
 
-Classifier jars (`-sources`, `-javadoc`, …) **skip** provenance download — Lightwell publishes attestation only for the main jar; the script prints a note.
+Classifier jars (`-sources`, `-javadoc`, …) **skip** POM/provenance auto-fetch — attestation is only for the main jar; the script prints a note.
 
 **Python** — On each `.whl` download, automatically fetches PEP 740 provenance from the  
 [Pulp Integrity API](https://docs.redhat.com/en/documentation/lightwell_network/current/configure-verify_provenance_for_python_wheel_artifacts)  
@@ -190,10 +208,11 @@ Lightwell publishes advisories as **OSV-format JSON files** at authenticated reg
 export LW_USER='XXXXXXX|service-account-name'
 export LW_TOKEN='your-token'
 
-# Download OSV JSON into download/osv/
-python3 lightwell_osv_advisories.py sync --ecosystem java --tier remediated
+# Interactive menu (no args) — sync / list / show / match
+python3 lightwell_osv_advisories.py
 
-# Local filters
+# Or CLI commands
+python3 lightwell_osv_advisories.py sync --ecosystem java --tier remediated
 python3 lightwell_osv_advisories.py list --package json-path
 python3 lightwell_osv_advisories.py list --cve CVE-2023-51074 --json
 python3 lightwell_osv_advisories.py show --id RHLW-2026-f8f17f4598510b8d
@@ -243,6 +262,9 @@ curl -s -o /dev/null -w '%{http_code}\n' -u "$LW_USER:$LW_TOKEN" \
 
 # Or run the same checklist in one go:
 python3 lightwell_catalog_api.py doctor
+
+# Interactive menu (no args)
+python3 lightwell_catalog_api.py
 
 # Package + version counts by ecosystem × security level (meta.count)
 python3 lightwell_catalog_api.py summary
@@ -309,7 +331,8 @@ Official how-tos: [Artifactory Java](https://docs.redhat.com/en/documentation/li
 | `--kind` | — | `python`, `java`, or `javascript` when using `--index-url` |
 | `--user` | `LW_USER` | Registry service account username |
 | `--token` | `LW_TOKEN` | Registry service account token |
-| `--output-dir` | — | Download directory (default: `download/`) |
+| `--output-dir` | — | Download root (default: `download/`); mirrors remote Maven/PyPI/npm paths underneath |
+| `--flat` | — | Legacy layout: save basenames only under `--output-dir` |
 | `--filter` | — | Substring filter for package / artifact names (browse + estimate) |
 | `--estimate-size` | — | HEAD-only size sample for the selected repo |
 | `--max-artifacts` | — | Cap for `--estimate-size` (default: `200`) |

@@ -12,6 +12,9 @@ Auth (Hybrid Console service account — NOT the registry XXXXXXX|name token):
   3. export RH_CLIENT_ID='...' RH_CLIENT_SECRET='...'
      or export LW_API_TOKEN='...' (short-lived Bearer from scope=api.console, ~15 min)
 
+Run with no arguments for an interactive menu, or pass a command
+(summary / packages / versions / advisories / doctor).
+
 Docs:
   https://docs.redhat.com/en/documentation/lightwell_network/current/get_started-lightwell_network_api_access
 
@@ -127,17 +130,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Query Lightwell catalog via content-sources API "
-            "(package / version counts and listings)."
+            "(package / version counts and listings). "
+            "Omit the command for an interactive menu."
         )
     )
     parser.add_argument(
         "command",
+        nargs="?",
         choices=("summary", "packages", "versions", "advisories", "doctor"),
+        default=None,
         help=(
-            "summary = counts by ecosystem×security_level; "
-            "packages / versions = list rows; "
-            "advisories = security advisories; "
-            "doctor = diagnose auth (JWT claims + probe endpoints)"
+            "Optional. summary / packages / versions / advisories / doctor. "
+            "Omit to open the interactive menu."
         ),
     )
     parser.add_argument(
@@ -815,19 +819,194 @@ only Hybrid Console API setup remains.
     return 1
 
 
-def main() -> int:
-    args = parse_args()
-    print()
-    print(bold(cyan("Lightwell catalog API")))
-    print(dim("content-sources · Bearer auth · catalog counts / listings"))
-    print()
-    ui_warn("Unofficial helper — not an officially supported Red Hat tool")
+def prompt_line(label: str, default: str = "") -> str:
+    hint = f" [{default}]" if default else ""
+    raw = input(dim(f"  {label}{hint}: ")).strip()
+    return raw if raw else default
 
+
+def prompt_yes_no(label: str, default: bool = False) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    raw = input(dim(f"  {label} [{suffix}]: ")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes"}
+
+
+def prompt_choice_menu(title: str, options: list[tuple[str, str]]) -> str:
+    while True:
+        print()
+        print(bold(title))
+        for i, (label, _) in enumerate(options, start=1):
+            print(f"  {cyan(f'{i:>2}')}  {label}")
+        print()
+        raw = input(dim("Select (number, or q to quit): ")).strip()
+        if not raw:
+            continue
+        if raw.lower() in {"q", "quit", "exit"}:
+            raise SystemExit(yellow("Cancelled."))
+        if not raw.isdigit():
+            ui_warn("Enter a number, or q to quit")
+            continue
+        idx = int(raw)
+        if 1 <= idx <= len(options):
+            return options[idx - 1][1]
+        ui_warn(f"Choose 1–{len(options)}")
+
+
+def ensure_interactive_console_auth(args: argparse.Namespace) -> None:
+    """Prompt for Hybrid Console SA if no token / client credentials are set."""
+    if (args.token or "").strip():
+        return
+    if (args.client_id or "").strip() and (args.client_secret or "").strip():
+        return
+    ui_step("Hybrid Console service account")
+    ui_info("console.redhat.com → Settings → Service Accounts (not registry LW_USER)")
+    ui_info("Needs Repositories viewer on a User Access group")
+    if not (args.client_id or "").strip():
+        args.client_id = prompt_line("Client ID (CLIENT_ID / RH_CLIENT_ID)")
+    if not (args.client_secret or "").strip():
+        args.client_secret = prompt_line("Client secret")
+    if not (args.client_id or "").strip() or not (args.client_secret or "").strip():
+        raise SystemExit(
+            "Hybrid Console CLIENT_ID + CLIENT_SECRET required "
+            "(or export TOKEN / LW_API_TOKEN with an SSO access_token)."
+        )
+
+
+def prompt_catalog_filters(args: argparse.Namespace, *, for_summary: bool) -> None:
+    eco = prompt_choice_menu(
+        "Ecosystem",
+        [
+            ("All (maven + python + npm)", "all"),
+            ("Maven / Java", "maven"),
+            ("Python", "python"),
+            ("npm / JavaScript", "npm"),
+        ],
+    )
+    args.ecosystem = None if eco == "all" else eco
+
+    level = prompt_choice_menu(
+        "Security level",
+        [
+            ("All (validated + remediated)", "all"),
+            ("Validated", "validated"),
+            ("Remediated", "remediated"),
+        ],
+    )
+    args.security_level = None if level == "all" else level
+
+    if for_summary:
+        args.name = prompt_line("Optional package name substring")
+        args.search = prompt_line("Optional search (packages endpoint)")
+        args.repository = prompt_line("Optional repository name filter")
+        return
+
+    args.name = prompt_line("Package name substring")
+    args.search = prompt_line("Search (packages only; name/group/scope)")
+    args.repository = prompt_line("Repository name filter")
+    limit_raw = prompt_line("Page size (limit)", str(args.limit or 50))
+    try:
+        args.limit = int(limit_raw)
+    except ValueError:
+        args.limit = 50
+    args.json = prompt_yes_no("Print raw JSON?", default=False)
+
+
+def interactive_menu(args: argparse.Namespace) -> int:
+    ui_info("Interactive mode — pick an action (CLI flags still work when passed)")
+    ui_info(
+        "Prefer lightwell_osv_advisories.py for CVE/advisory integrations "
+        "(OSV JSON sync)"
+    )
+
+    cached_token: str | None = None
+
+    while True:
+        action = prompt_choice_menu(
+            "What do you want to do?",
+            [
+                ("Catalog summary (package + version counts)", "summary"),
+                ("List packages", "packages"),
+                ("List package versions", "versions"),
+                ("List advisories (API probe — prefer OSV script)", "advisories"),
+                ("Auth doctor (Get Started checklist)", "doctor"),
+                ("Quit", "quit"),
+            ],
+        )
+        if action == "quit":
+            print()
+            print(dim("Done."))
+            return 0
+
+        try:
+            if action == "doctor":
+                ensure_interactive_console_auth(args)
+                code = cmd_doctor(args)
+            else:
+                ensure_interactive_console_auth(args)
+                if not cached_token:
+                    cached_token = resolve_token(args)
+                token = cached_token
+
+                if action == "summary":
+                    prompt_catalog_filters(args, for_summary=True)
+                    code = cmd_summary(token, args)
+                elif action == "packages":
+                    prompt_catalog_filters(args, for_summary=False)
+                    code = cmd_packages(token, args)
+                elif action == "versions":
+                    prompt_catalog_filters(args, for_summary=False)
+                    args.search = ""  # versions endpoint has no search
+                    code = cmd_versions(token, args)
+                elif action == "advisories":
+                    ui_step("Advisories (content-sources)")
+                    ui_warn(
+                        "For integrations, sync OSV JSON with lightwell_osv_advisories.py"
+                    )
+                    args.severity_min = prompt_line(
+                        "Minimum severity (e.g. important, critical)", ""
+                    )
+                    limit_raw = prompt_line("Page size (limit)", str(args.limit or 50))
+                    try:
+                        args.limit = int(limit_raw)
+                    except ValueError:
+                        args.limit = 50
+                    args.json = prompt_yes_no("Print raw JSON?", default=False)
+                    code = cmd_advisories(token, args)
+                else:
+                    code = 1
+        except SystemExit as exc:
+            code_val = exc.code
+            msg = str(code_val) if code_val is not None else ""
+            if code_val == 130 or "Cancelled" in msg:
+                raise
+            if isinstance(code_val, int):
+                code = code_val
+                if code != 0 and msg and msg not in {"0", "1"}:
+                    ui_err(msg)
+            else:
+                if msg:
+                    ui_err(msg)
+                code = 1
+            # Auth failure — drop cached token so next try re-fetches
+            if code != 0:
+                cached_token = None
+
+        if code == 0:
+            ui_ok("Action finished")
+        again = prompt_yes_no("Back to main menu?", default=True)
+        if not again:
+            return code
+
+
+def dispatch(args: argparse.Namespace) -> int:
+    if args.command is None:
+        return interactive_menu(args)
     if args.command == "doctor":
         return cmd_doctor(args)
 
     token = resolve_token(args)
-
     if args.command == "summary":
         return cmd_summary(token, args)
     if args.command == "packages":
@@ -837,6 +1016,16 @@ def main() -> int:
     if args.command == "advisories":
         return cmd_advisories(token, args)
     raise SystemExit(f"Unknown command: {args.command}")
+
+
+def main() -> int:
+    args = parse_args()
+    print()
+    print(bold(cyan("Lightwell catalog API")))
+    print(dim("content-sources · Bearer auth · catalog counts / listings"))
+    print()
+    ui_warn("Unofficial helper — not an officially supported Red Hat tool")
+    return dispatch(args)
 
 
 if __name__ == "__main__":

@@ -21,3 +21,4 @@ venv/
 .vscode/
 
 *jg-sbom.json
+jg-prep.sh

@@ -18,6 +18,8 @@ Auth (registry SA — same as the downloader):
   export LW_USER='XXXXXXX|service-account-name'
   export LW_TOKEN='your-token'
 
+Run with no arguments for an interactive menu, or pass a command (sync/list/show/match).
+
 Public mirror (optional, no registry auth): https://github.com/project-lightwell/lightwell-osv
 
 Unofficial helper — not an officially supported Red Hat product.
@@ -132,17 +134,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Sync Lightwell OSV advisory JSON from the registry (Basic Auth) "
-            "and filter locally."
+            "and filter locally. Omit the command for an interactive menu."
         )
     )
     parser.add_argument(
         "command",
+        nargs="?",
         choices=("sync", "list", "show", "match"),
+        default=None,
         help=(
-            "sync = download OSV JSON into a local cache; "
-            "list = filter cached (or freshly synced) advisories; "
-            "show = print one advisory by id; "
-            "match = filter against package names from a file / args"
+            "Optional. sync / list / show / match. "
+            "Omit to open the interactive menu."
         ),
     )
     parser.add_argument(
@@ -717,6 +719,246 @@ def cmd_match(args: argparse.Namespace) -> int:
     return 0
 
 
+def prompt_line(label: str, default: str = "") -> str:
+    hint = f" [{default}]" if default else ""
+    raw = input(dim(f"  {label}{hint}: ")).strip()
+    return raw if raw else default
+
+
+def prompt_yes_no(label: str, default: bool = False) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    raw = input(dim(f"  {label} [{suffix}]: ")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes"}
+
+
+def prompt_choice_menu(title: str, options: list[tuple[str, str]]) -> str:
+    """Return the value for the chosen (label, value) option. 'q' raises SystemExit."""
+    while True:
+        print()
+        print(bold(title))
+        for i, (label, _) in enumerate(options, start=1):
+            print(f"  {cyan(f'{i:>2}')}  {label}")
+        print()
+        raw = input(dim("Select (number, or q to quit): ")).strip()
+        if not raw:
+            continue
+        if raw.lower() in {"q", "quit", "exit"}:
+            raise SystemExit(yellow("Cancelled."))
+        if not raw.isdigit():
+            ui_warn("Enter a number, or q to quit")
+            continue
+        idx = int(raw)
+        if 1 <= idx <= len(options):
+            return options[idx - 1][1]
+        ui_warn(f"Choose 1–{len(options)}")
+
+
+def ensure_interactive_auth(args: argparse.Namespace) -> None:
+    """Prompt for registry SA if source=registry and env/flags are empty."""
+    if args.source != "registry":
+        return
+    if args.user and args.token:
+        return
+    ui_step("Registry service account")
+    ui_info("Same LW_USER / LW_TOKEN as the package downloader")
+    ui_info("Or pick GitHub mirror from the sync menu to skip auth")
+    if not args.user:
+        args.user = prompt_line("Username (XXXXXXX|name)")
+    if not args.token:
+        args.token = prompt_line("Token")
+    if not args.user or not args.token:
+        raise SystemExit(
+            "Registry auth required, or use source=github for the public mirror."
+        )
+
+
+def prompt_scope(args: argparse.Namespace) -> None:
+    args.ecosystem = prompt_choice_menu(
+        "Ecosystem",
+        [
+            ("All (java + python)", "all"),
+            ("Java / Maven", "java"),
+            ("Python / PyPI", "python"),
+        ],
+    )
+    args.tier = prompt_choice_menu(
+        "Tier",
+        [
+            ("Remediated (default)", "remediated"),
+            ("Predisclosure", "predisclosure"),
+            ("All tiers", "all"),
+        ],
+    )
+
+
+def interactive_sync(args: argparse.Namespace) -> int:
+    ui_step("Sync OSV advisories")
+    args.source = prompt_choice_menu(
+        "Source",
+        [
+            ("Registry (packages.redhat.com — needs LW_USER/LW_TOKEN)", "registry"),
+            ("GitHub public mirror (project-lightwell/lightwell-osv)", "github"),
+        ],
+    )
+    if args.source == "registry":
+        prompt_scope(args)
+        ensure_interactive_auth(args)
+    else:
+        args.ecosystem = "all"
+        args.tier = "remediated"
+    args.force = prompt_yes_no("Re-download files that already exist?", default=False)
+    return cmd_sync(args)
+
+
+def interactive_list(args: argparse.Namespace) -> int:
+    ui_step("List / filter advisories")
+    prompt_scope(args)
+    ui_info("Leave filters blank to list broadly (capped by --limit)")
+    args.package = prompt_line("Package substring (e.g. json-path, spring-core)")
+    args.cve = prompt_line("CVE / GHSA (e.g. CVE-2023-51074)")
+    args.id = prompt_line("Advisory id substring (e.g. RHLW-2026)")
+    limit_raw = prompt_line("Max rows to print", "50")
+    try:
+        args.limit = int(limit_raw)
+    except ValueError:
+        args.limit = 50
+    args.json = prompt_yes_no("Print full JSON?", default=False)
+    if args.source == "registry" and not (
+        Path(args.cache_dir).exists()
+        and any(Path(args.cache_dir).rglob("*.json"))
+    ):
+        ensure_interactive_auth(args)
+    return cmd_list(args)
+
+
+def interactive_show(args: argparse.Namespace) -> int:
+    ui_step("Show one advisory")
+    prompt_scope(args)
+    while True:
+        args.id = prompt_line("Advisory id (RHLW-…)")
+        if args.id:
+            break
+        ui_warn("An advisory id is required")
+    if args.source == "registry" and not (
+        Path(args.cache_dir).exists()
+        and any(Path(args.cache_dir).rglob("*.json"))
+    ):
+        ensure_interactive_auth(args)
+    return cmd_show(args)
+
+
+def interactive_match(args: argparse.Namespace) -> int:
+    ui_step("Match packages against advisories")
+    prompt_scope(args)
+    mode = prompt_choice_menu(
+        "How to supply package names?",
+        [
+            ("Type a package substring", "one"),
+            ("Path to a text file (one name per line)", "file"),
+        ],
+    )
+    if mode == "file":
+        while True:
+            args.packages_file = prompt_line("Packages file path")
+            if args.packages_file and Path(args.packages_file).is_file():
+                break
+            ui_warn("File not found — try again")
+        args.package = ""
+    else:
+        while True:
+            args.package = prompt_line("Package substring")
+            if args.package:
+                break
+            ui_warn("Package name required")
+        args.packages_file = ""
+    args.cve = prompt_line("Optional CVE filter")
+    limit_raw = prompt_line("Max rows to print", "50")
+    try:
+        args.limit = int(limit_raw)
+    except ValueError:
+        args.limit = 50
+    args.json = prompt_yes_no("Print full JSON?", default=False)
+    if args.source == "registry" and not (
+        Path(args.cache_dir).exists()
+        and any(Path(args.cache_dir).rglob("*.json"))
+    ):
+        ensure_interactive_auth(args)
+    return cmd_match(args)
+
+
+def interactive_menu(args: argparse.Namespace) -> int:
+    """Loop until the user quits. CLI flags remain defaults unless prompted."""
+    ui_info("Interactive mode — pick an action (CLI flags still work when passed)")
+    cache = Path(args.cache_dir)
+    if cache.exists():
+        n = sum(1 for _ in cache.rglob("*.json") if "_github" not in _.parts)
+        ui_info(f"Local cache: {cache} ({n} json file(s))")
+    else:
+        ui_info(f"Local cache empty — choose Sync first ({cache})")
+
+    while True:
+        action = prompt_choice_menu(
+            "What do you want to do?",
+            [
+                ("Sync OSV JSON into local cache", "sync"),
+                ("List / filter advisories in the cache", "list"),
+                ("Show one advisory by id (full JSON)", "show"),
+                ("Match package names against advisories", "match"),
+                ("Quit", "quit"),
+            ],
+        )
+        if action == "quit":
+            print()
+            print(dim("Done."))
+            return 0
+        try:
+            if action == "sync":
+                code = interactive_sync(args)
+            elif action == "list":
+                code = interactive_list(args)
+            elif action == "show":
+                code = interactive_show(args)
+            elif action == "match":
+                code = interactive_match(args)
+            else:
+                code = 1
+        except SystemExit as exc:
+            code_val = exc.code
+            msg = str(code_val) if code_val is not None else ""
+            if code_val == 130 or "Cancelled" in msg:
+                raise
+            if isinstance(code_val, int):
+                code = code_val
+                if code != 0 and msg and msg not in {"0", "1"}:
+                    ui_err(msg)
+            else:
+                # raise SystemExit("error text") — stay in menu
+                if msg:
+                    ui_err(msg)
+                code = 1
+        if code == 0:
+            ui_ok("Action finished")
+        again = prompt_yes_no("Back to main menu?", default=True)
+        if not again:
+            return code
+
+
+def dispatch(args: argparse.Namespace) -> int:
+    if args.command == "sync":
+        return cmd_sync(args)
+    if args.command == "list":
+        return cmd_list(args)
+    if args.command == "show":
+        return cmd_show(args)
+    if args.command == "match":
+        return cmd_match(args)
+    if args.command is None:
+        return interactive_menu(args)
+    raise SystemExit(f"Unknown command: {args.command}")
+
+
 def main() -> int:
     args = parse_args()
     print()
@@ -728,16 +970,7 @@ def main() -> int:
         "Advisories are pre-published OSV files — sync + filter locally "
         "(not a live advisory query API)."
     )
-
-    if args.command == "sync":
-        return cmd_sync(args)
-    if args.command == "list":
-        return cmd_list(args)
-    if args.command == "show":
-        return cmd_show(args)
-    if args.command == "match":
-        return cmd_match(args)
-    raise SystemExit(f"Unknown command: {args.command}")
+    return dispatch(args)
 
 
 if __name__ == "__main__":
