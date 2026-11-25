@@ -269,6 +269,14 @@ python3 lightwell_catalog_api.py
 # Package + version counts by ecosystem × security level (meta.count)
 python3 lightwell_catalog_api.py summary
 
+# Snapshot those counts to CSV (append; use --csv-replace-day for one set per SGT day)
+python3 lightwell_catalog_api.py summary \
+  --csv download/catalog-summary.csv --csv-replace-day
+
+# Cloud / unattended (recommended — no Mac required):
+#   google-apps-script/  → 08:00 & 15:00 Asia/Singapore → Google Sheet + Web app dashboard
+#   See google-apps-script/README.md
+
 # Optional filters
 python3 lightwell_catalog_api.py summary --ecosystem maven --security-level validated
 

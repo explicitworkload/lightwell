@@ -6,11 +6,13 @@ This is separate from lightwell_download_python_remediated.py:
   - Downloader  → packages.redhat.com (registry Basic Auth) — fetch binaries
   - This script → console.redhat.com/api/content-sources (Bearer token) — catalog counts/metadata
 
-Auth (Hybrid Console service account — NOT the registry XXXXXXX|name token):
-  1. Create a service account in Hybrid Cloud Console (Settings → Service Accounts)
-  2. Add it to a User Access group with the Repositories viewer role
-  3. export RH_CLIENT_ID='...' RH_CLIENT_SECRET='...'
-     or export LW_API_TOKEN='...' (short-lived Bearer from scope=api.console, ~15 min)
+Auth (NOT the registry XXXXXXX|name / LW_TOKEN — that is Basic Auth only):
+  A. Hybrid Console SA: RH_CLIENT_ID + RH_CLIENT_SECRET (scope=api.console)  [preferred]
+  B. User offline token: OFFLINE_TOKEN from access.redhat.com/management/api
+     (rhsm-api refresh — same path as google-apps-script/Code.gs)
+  C. Short-lived Bearer: LW_API_TOKEN / ACCESS_TOKEN / TOKEN (~15 min)
+
+  Stale $TOKEN often masks OFFLINE_TOKEN: if doctor 401s, unset TOKEN and retry.
 
 Run with no arguments for an interactive menu, or pass a command
 (summary / packages / versions / advisories / doctor).
@@ -25,12 +27,18 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import json
 import os
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+SGT = ZoneInfo("Asia/Singapore")
+from pathlib import Path
 from typing import Any
 
 SSO_TOKEN_URL = (
@@ -48,13 +56,15 @@ TOKEN_SCOPES = (
 ECOSYSTEMS = ("maven", "python", "npm")
 SECURITY_LEVELS = ("validated", "remediated")
 
-# Get Started sanity probe first, then broader console/content-sources checks.
-# 401 = JWT not accepted; 200/403 = gateway accepted the Bearer token.
+# Auth probes: 401 = JWT not accepted; anything else = Bearer was accepted.
+# Prefer Lightwell packages (known-good). lightwell/repositories currently returns
+# HTTP 400 Bad Request even with a valid token — that is an API/path issue, not auth.
 AUTH_PROBE_PATHS = (
-    "/api/content-sources/v1.0/lightwell/repositories/",
-    "/api/content-sources/v1.0/repositories/?limit=1",
     "/api/content-sources/v1.0/lightwell/packages?limit=1",
+    "/api/content-sources/v1.0/repositories/?limit=1",
     "/api/rbac/v1/access/?application=content-sources",
+    # Kept last for visibility; expect 400 until the API accepts bare GETs.
+    "/api/content-sources/v1.0/lightwell/repositories/?limit=1",
 )
 
 # Registry membership check (Basic Auth) — separate from API Bearer setup.
@@ -220,6 +230,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Request demo catalog (API demo=true)",
     )
+    parser.add_argument(
+        "--csv",
+        default="",
+        help=(
+            "summary: write/append rows to this CSV path "
+            "(default columns: snapshot_at, ecosystem, security_level, packages, versions)"
+        ),
+    )
+    parser.add_argument(
+        "--csv-replace-day",
+        action="store_true",
+        help=(
+            "summary + --csv: drop existing rows for today's SGT date before appending "
+            "(keeps one snapshot per calendar day)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -245,6 +271,7 @@ def summarize_claims(claims: dict[str, Any]) -> dict[str, Any]:
         "scope",
         "scp",
         "typ",
+        "exp",
         "preferred_username",
         "client_id",
         "username",
@@ -258,7 +285,42 @@ def summarize_claims(claims: dict[str, Any]) -> dict[str, Any]:
     for key in keys:
         if key in claims and claims[key] is not None:
             out[key] = claims[key]
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)):
+        try:
+            out["exp_sgt"] = datetime.fromtimestamp(exp, tz=SGT).strftime(
+                "%b %d, %Y %H:%M %Z"
+            )
+            out["expired"] = exp < datetime.now(tz=SGT).timestamp()
+        except (OverflowError, OSError, ValueError):
+            pass
     return out
+
+
+def jwt_looks_console_capable(token: str) -> bool:
+    """Heuristic: access token likely meant for console.redhat.com APIs."""
+    claims = decode_jwt_claims(token)
+    if not claims:
+        return False
+    scope = str(claims.get("scope") or claims.get("scp") or "")
+    if "api.console" in scope:
+        return True
+    aud = claims.get("aud") or []
+    if isinstance(aud, str):
+        aud = [aud]
+    for item in aud:
+        text = str(item).lower()
+        if "console" in text or "cloud-services" in text:
+            return True
+    return False
+
+
+def jwt_is_expired(token: str) -> bool:
+    claims = decode_jwt_claims(token)
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)):
+        return False
+    return exp < datetime.now(tz=SGT).timestamp()
 
 
 def request_sso_token(client_id: str, client_secret: str, scope: str) -> tuple[str, int]:
@@ -298,6 +360,52 @@ def request_sso_token(client_id: str, client_secret: str, scope: str) -> tuple[s
     expires = payload.get("expires_in")
     expires_i = int(expires) if isinstance(expires, int) else 0
     return token, expires_i
+
+
+def request_offline_access_token(offline_token: str) -> tuple[str, int]:
+    """Refresh a user offline token via client_id=rhsm-api (Apps Script AUTH_MODE=offline)."""
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "client_id": "rhsm-api",
+            "refresh_token": offline_token,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        SSO_TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "lightwell-catalog-api/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise SystemExit(
+            f"SSO offline refresh failed: HTTP {exc.code}\n{detail}\n"
+            "Regenerate the offline token at https://access.redhat.com/management/api"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"SSO offline refresh failed: {exc.reason}") from exc
+
+    token = payload.get("access_token")
+    if not isinstance(token, str) or not token:
+        raise SystemExit(f"SSO offline refresh missing access_token: {payload!r}")
+    expires = payload.get("expires_in")
+    expires_i = int(expires) if isinstance(expires, int) else 0
+    return token, expires_i
+
+
+def env_offline_token() -> str:
+    return (
+        os.environ.get("OFFLINE_TOKEN")
+        or os.environ.get("RH_OFFLINE_TOKEN")
+        or ""
+    ).strip()
 
 
 def http_status(url: str, token: str) -> tuple[int, str]:
@@ -374,22 +482,65 @@ def fetch_bearer_token(client_id: str, client_secret: str) -> str:
 
 
 def resolve_token(args: argparse.Namespace) -> str:
-    if args.token:
-        ui_info("using Bearer token from --token / $LW_API_TOKEN")
-        return args.token.strip()
-    if args.client_id and args.client_secret:
+    client_id = (args.client_id or "").strip()
+    client_secret = (args.client_secret or "").strip()
+    access = (args.token or "").strip()
+    offline = env_offline_token()
+
+    # Prefer Hybrid Console SA when configured.
+    if client_id and client_secret:
         ui_info("fetching Bearer token via RH_CLIENT_ID / RH_CLIENT_SECRET")
-        return fetch_bearer_token(args.client_id.strip(), args.client_secret.strip())
+        return fetch_bearer_token(client_id, client_secret)
+
+    # Access token only if it looks console-capable (and not expired).
+    if access and _looks_like_jwt(access):
+        expired = jwt_is_expired(access)
+        capable = jwt_looks_console_capable(access)
+        if capable and not expired:
+            ui_info("using Bearer token from --token / $LW_API_TOKEN / $TOKEN")
+            return access
+        if offline:
+            reason = "expired" if expired else "missing api.console / console aud"
+            ui_warn(
+                f"$TOKEN looks unusable for content-sources ({reason}) — "
+                "refreshing via $OFFLINE_TOKEN instead"
+            )
+        elif expired:
+            raise SystemExit(
+                "$TOKEN JWT is expired. unset TOKEN and use OFFLINE_TOKEN or "
+                "RH_CLIENT_ID/SECRET, or mint a fresh access_token.\n"
+                "Diagnose with: python3 lightwell_catalog_api.py doctor"
+            )
+        else:
+            ui_warn(
+                "$TOKEN JWT has no api.console scope — console.redhat.com often returns 401"
+            )
+            ui_info("using Bearer token anyway (no OFFLINE_TOKEN / SA configured)")
+            return access
+
+    if offline:
+        ui_info("fetching Bearer via $OFFLINE_TOKEN (rhsm-api refresh_token)")
+        token, expires = request_offline_access_token(offline)
+        ui_ok(f"offline refresh ok (expires_in≈{expires}s)")
+        return token
+
+    if access:
+        ui_info("using Bearer token from --token / $LW_API_TOKEN / $TOKEN")
+        return access
+
     raise SystemExit(
         "Catalog API auth required.\n"
         "Option A — Hybrid Console service account:\n"
         "  export RH_CLIENT_ID='...'\n"
         "  export RH_CLIENT_SECRET='...'\n"
-        "Option B — short-lived token (~15 min):\n"
+        "Option B — user offline token (same as Apps Script):\n"
+        "  export OFFLINE_TOKEN='...'   # access.redhat.com/management/api\n"
+        "Option C — short-lived token (~15 min):\n"
         "  export LW_API_TOKEN='...'\n"
         "\n"
         "This is different from the registry SA used by the download script "
         "(XXXXXXX|name + LW_TOKEN).\n"
+        "If a stale $TOKEN is set, run: unset TOKEN LW_API_TOKEN ACCESS_TOKEN\n"
         "Diagnose with: python3 lightwell_catalog_api.py doctor"
     )
 
@@ -461,20 +612,26 @@ def build_list_params(args: argparse.Namespace) -> dict[str, Any]:
     return params
 
 
-def cmd_summary(token: str, args: argparse.Namespace) -> int:
-    """Print package and version counts from meta.count (limit=1 probes)."""
+CSV_FIELDS = (
+    "snapshot_at",
+    "ecosystem",
+    "security_level",
+    "packages",
+    "versions",
+)
+
+
+def collect_summary_rows(
+    token: str, args: argparse.Namespace
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Return (rows, total_packages, total_versions) for summary probes."""
     ecosystems = (args.ecosystem,) if args.ecosystem else ECOSYSTEMS
     levels = (args.security_level,) if args.security_level else SECURITY_LEVELS
-
-    ui_step("Catalog summary (meta.count)")
-    ui_info("Source: GET /lightwell/packages and /lightwell/package_versions")
-    print()
-    header = f"{'ecosystem':<10} {'level':<12} {'packages':>10} {'versions':>10}"
-    print(bold(header))
-    print(dim("-" * len(header)))
-
+    snapshot_at = datetime.now(SGT).isoformat(timespec="seconds")
+    rows: list[dict[str, Any]] = []
     total_packages = 0
     total_versions = 0
+
     for ecosystem in ecosystems:
         for level in levels:
             base = {
@@ -498,11 +655,67 @@ def cmd_summary(token: str, args: argparse.Namespace) -> int:
             vcount = meta_count(versions)
             if pcount is None or vcount is None:
                 ui_warn(f"{ecosystem}/{level}: response missing meta.count")
-                print(f"{ecosystem:<10} {level:<12} {'?':>10} {'?':>10}")
                 continue
             total_packages += pcount
             total_versions += vcount
-            print(f"{ecosystem:<10} {level:<12} {pcount:>10,} {vcount:>10,}")
+            rows.append(
+                {
+                    "snapshot_at": snapshot_at,
+                    "ecosystem": ecosystem,
+                    "security_level": level,
+                    "packages": pcount,
+                    "versions": vcount,
+                }
+            )
+    return rows, total_packages, total_versions
+
+
+def write_summary_csv(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    replace_day: bool,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing: list[dict[str, str]] = []
+    if path.is_file():
+        with path.open(newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                existing.append(dict(row))
+
+    if replace_day and rows:
+        today = rows[0]["snapshot_at"][:10]  # YYYY-MM-DD
+        existing = [
+            row
+            for row in existing
+            if not str(row.get("snapshot_at", "")).startswith(today)
+        ]
+
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(CSV_FIELDS))
+        writer.writeheader()
+        for row in existing:
+            writer.writerow({k: row.get(k, "") for k in CSV_FIELDS})
+        for row in rows:
+            writer.writerow(row)
+
+
+def cmd_summary(token: str, args: argparse.Namespace) -> int:
+    """Print package and version counts from meta.count (limit=1 probes)."""
+    ui_step("Catalog summary (meta.count)")
+    ui_info("Source: GET /lightwell/packages and /lightwell/package_versions")
+    print()
+    header = f"{'ecosystem':<10} {'level':<12} {'packages':>10} {'versions':>10}"
+    print(bold(header))
+    print(dim("-" * len(header)))
+
+    rows, total_packages, total_versions = collect_summary_rows(token, args)
+    for row in rows:
+        print(
+            f"{row['ecosystem']:<10} {row['security_level']:<12} "
+            f"{row['packages']:>10,} {row['versions']:>10,}"
+        )
 
     print(dim("-" * len(header)))
     print(f"{'TOTAL':<10} {'(listed)':<12} {total_packages:>10,} {total_versions:>10,}")
@@ -511,6 +724,16 @@ def cmd_summary(token: str, args: argparse.Namespace) -> int:
         "These are catalog package/version counts (Lens-style), not file counts "
         "(.jar/.pom/-sources) and not disk bytes."
     )
+
+    csv_path = (args.csv or "").strip()
+    if csv_path:
+        out = Path(csv_path).expanduser()
+        write_summary_csv(out, rows, replace_day=bool(args.csv_replace_day))
+        ui_ok(f"CSV {'updated' if out.is_file() else 'written'}: {out.resolve()}")
+        if args.csv_replace_day:
+            ui_info("replaced any prior rows for today's SGT date, then appended")
+        else:
+            ui_info("appended this snapshot (use --csv-replace-day for one row-set per day)")
     return 0
 
 
@@ -700,11 +923,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     """Get Started checklist: Hybrid Console SA → SSO token → lightwell/repositories."""
     ui_step("Auth doctor (Get Started: Lightwell Network API access)")
     ui_info(
-        "API needs Hybrid Console SA (console.redhat.com → Settings → Service Accounts)"
+        "API Bearer: Hybrid Console SA (api.console) or OFFLINE_TOKEN (rhsm-api refresh)"
     )
     ui_info(
-        "Registry SA (1234567|name) is Basic Auth for packages.redhat.com only — "
-        "its token is NOT a console Bearer"
+        "Registry SA (1234567|name + LW_TOKEN) is Basic Auth for packages.redhat.com only"
     )
 
     _token_env_sanity()
@@ -712,8 +934,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     client_id = (args.client_id or "").strip()
     client_secret = (args.client_secret or "").strip()
 
-    ui_step("2) Does the SSO token request work?")
+    ui_step("2) Collect candidate Bearer tokens")
     tokens: list[tuple[str, str]] = []
+    offline = env_offline_token()
+
     if args.token:
         tok = args.token.strip()
         if not _looks_like_jwt(tok):
@@ -721,9 +945,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "Supplied --token / $TOKEN does not look like an SSO access_token JWT"
             )
         else:
-            ui_ok("using pre-supplied Bearer JWT (skipping client_credentials)")
-            tokens = [("pre-supplied $TOKEN / LW_API_TOKEN / --token", tok)]
-    elif client_id and client_secret:
+            capable = jwt_looks_console_capable(tok)
+            expired = jwt_is_expired(tok)
+            if expired:
+                ui_warn("pre-supplied $TOKEN JWT is expired")
+            elif not capable:
+                ui_warn(
+                    "pre-supplied $TOKEN is rhsm-api / graphql-scoped "
+                    "(no api.console) — content-sources often returns 401"
+                )
+            else:
+                ui_ok("pre-supplied Bearer JWT looks console-capable")
+            tokens.append(("pre-supplied $TOKEN / LW_API_TOKEN / --token", tok))
+
+    if client_id and client_secret:
         warn_if_registry_shaped_client_id(client_id)
         ui_info(f"client_id length={len(client_id)}  prefix={client_id[:12]!r}…")
         for scope in TOKEN_SCOPES:
@@ -732,28 +967,31 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             except SystemExit as exc:
                 ui_err(str(exc))
                 continue
-            # Equivalent to: curl … | jq 'keys'  → expect access_token, expires_in
             ui_ok(
                 f"SSO keys ok for scope={scope!r} "
                 f"(access_token + expires_in≈{expires}s)"
             )
-            tokens.append((f"scope={scope!r} expires≈{expires}s", tok))
-        if not tokens:
-            ui_err(
-                "SSO returned error — client ID or secret is wrong "
-                "(or not a Hybrid Console service account)"
-            )
-            _probe_registry_membership()
-            return 1
+            tokens.append((f"SA client_credentials scope={scope!r}", tok))
+
+    if offline:
+        try:
+            tok, expires = request_offline_access_token(offline)
+            ui_ok(f"OFFLINE_TOKEN refresh ok (expires_in≈{expires}s)")
+            tokens.append(("OFFLINE_TOKEN → rhsm-api refresh_token", tok))
+        except SystemExit as exc:
+            ui_err(str(exc))
     else:
+        ui_info("$OFFLINE_TOKEN unset — skip user offline refresh path")
+
+    if not tokens:
         ui_err(
-            "Set Hybrid Console CLIENT_ID/CLIENT_SECRET (or RH_CLIENT_ID/SECRET), "
+            "No auth candidates. Set RH_CLIENT_ID/SECRET, or OFFLINE_TOKEN, "
             "or a Bearer TOKEN from SSO"
         )
         _probe_registry_membership()
         return 1
 
-    ui_step("3) Sanity: GET /lightwell/repositories/ with Bearer")
+    ui_step("3) Sanity: GET content-sources with Bearer")
     any_ok = False
     for label, token in tokens:
         print()
@@ -764,9 +1002,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             print(dim(json.dumps(claims, indent=2)))
             scope_claim = str(claims.get("scope") or claims.get("scp") or "")
-            if "api.console" not in scope_claim and label.startswith("scope="):
+            if claims.get("expired"):
+                ui_warn("JWT exp is in the past")
+            if "api.console" not in scope_claim and "rhsm-api" not in str(
+                claims.get("azp") or ""
+            ):
                 ui_warn(
                     "jwt.scope does not include api.console — console may return 401"
+                )
+            elif "api.console" not in scope_claim:
+                ui_info(
+                    "jwt.scope has no api.console (normal for rhsm-api offline refresh)"
                 )
         accepted, probes = probe_console_accepts_token(token)
         for path, code in probes:
@@ -776,6 +1022,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 ui_ok(f"HTTP {code}  {path}")
             elif code == 403:
                 ui_warn(f"HTTP {code}  {path}  (auth ok; missing Repositories viewer?)")
+            elif code == 400 and "lightwell/repositories" in path:
+                ui_info(
+                    f"HTTP {code}  {path}  (auth ok; this Lightwell path rejects "
+                    "bare GET — not an auth failure)"
+                )
             else:
                 ui_info(f"HTTP {code}  {path}")
         if accepted:
@@ -798,21 +1049,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(
         dim(
             """
-Get Started checklist:
-  1. Create SA at console.redhat.com → Settings → Service Accounts
-     (NOT Terms-based Registry; username 1234567|name will not work as CLIENT_ID)
-  2. Add SA to a User Access group with Repositories viewer
-  3. export CLIENT_ID=… CLIENT_SECRET=…   # or RH_CLIENT_ID / RH_CLIENT_SECRET
-  4. TOKEN=$(curl -s …/token -d grant_type=client_credentials \\
-         -d client_id="$CLIENT_ID" -d client_secret="$CLIENT_SECRET" \\
-         -d scope=api.console | jq -r .access_token)
-     # Confirm: echo "$TOKEN" | cut -c1-20   → should look like eyJ… (JWT), not a registry secret
-  5. curl -s 'https://console.redhat.com/api/content-sources/v1.0/lightwell/repositories/' \\
-         -H "Authorization: Bearer $TOKEN" | jq . | head -40
+Quick fix if $TOKEN is stale / wrong (common):
+  unset TOKEN LW_API_TOKEN ACCESS_TOKEN
+  source ./jg-prep.sh          # provides OFFLINE_TOKEN
+  python3 lightwell_catalog_api.py doctor
 
-If step 4 works but step 5 is 401: wrong token in $TOKEN, or SA not from this org.
-If registry membership (step 4 in doctor) is 200: Lightwell entitlement is fine —
-only Hybrid Console API setup remains.
+Get Started checklist:
+  1. Preferred: Hybrid Console SA at console.redhat.com → Settings → Service Accounts
+     Add SA to a User Access group with Repositories viewer
+     export RH_CLIENT_ID=… RH_CLIENT_SECRET=…
+  2. Or user offline token (same as Apps Script):
+     export OFFLINE_TOKEN=…   # https://access.redhat.com/management/api
+  3. Or short-lived Bearer with scope=api.console in LW_API_TOKEN
+  4. curl probe lightwell/repositories/ with Authorization: Bearer …
+
+If registry membership probe is 200: Lightwell entitlement is fine —
+only Hybrid Console / Bearer setup remains.
 """
         )
     )
@@ -855,23 +1107,32 @@ def prompt_choice_menu(title: str, options: list[tuple[str, str]]) -> str:
 
 
 def ensure_interactive_console_auth(args: argparse.Namespace) -> None:
-    """Prompt for Hybrid Console SA if no token / client credentials are set."""
-    if (args.token or "").strip():
+    """Prompt for Hybrid Console SA if no usable auth is configured."""
+    if env_offline_token():
+        return
+    access = (args.token or "").strip()
+    if access and _looks_like_jwt(access) and (
+        jwt_looks_console_capable(access) and not jwt_is_expired(access)
+    ):
         return
     if (args.client_id or "").strip() and (args.client_secret or "").strip():
         return
-    ui_step("Hybrid Console service account")
-    ui_info("console.redhat.com → Settings → Service Accounts (not registry LW_USER)")
-    ui_info("Needs Repositories viewer on a User Access group")
+    ui_step("Hybrid Console auth")
+    ui_info("Preferred: console.redhat.com → Settings → Service Accounts + Repositories viewer")
+    ui_info("Or set OFFLINE_TOKEN (access.redhat.com/management/api) — same as Apps Script")
     if not (args.client_id or "").strip():
-        args.client_id = prompt_line("Client ID (CLIENT_ID / RH_CLIENT_ID)")
-    if not (args.client_secret or "").strip():
+        args.client_id = prompt_line("Client ID (CLIENT_ID / RH_CLIENT_ID, blank to skip)")
+    if (args.client_id or "").strip() and not (args.client_secret or "").strip():
         args.client_secret = prompt_line("Client secret")
-    if not (args.client_id or "").strip() or not (args.client_secret or "").strip():
-        raise SystemExit(
-            "Hybrid Console CLIENT_ID + CLIENT_SECRET required "
-            "(or export TOKEN / LW_API_TOKEN with an SSO access_token)."
-        )
+    if (args.client_id or "").strip() and (args.client_secret or "").strip():
+        return
+    if env_offline_token() or (args.token or "").strip():
+        return
+    raise SystemExit(
+        "Auth required: RH_CLIENT_ID/SECRET, or OFFLINE_TOKEN, "
+        "or TOKEN / LW_API_TOKEN with an SSO access_token.\n"
+        "Diagnose with: python3 lightwell_catalog_api.py doctor"
+    )
 
 
 def prompt_catalog_filters(args: argparse.Namespace, *, for_summary: bool) -> None:
@@ -951,6 +1212,17 @@ def interactive_menu(args: argparse.Namespace) -> int:
 
                 if action == "summary":
                     prompt_catalog_filters(args, for_summary=True)
+                    if prompt_yes_no("Also write/append a CSV snapshot?", default=False):
+                        args.csv = prompt_line(
+                            "CSV path", "download/catalog-summary.csv"
+                        )
+                        args.csv_replace_day = prompt_yes_no(
+                            "Replace today's SGT rows if already present?",
+                            default=True,
+                        )
+                    else:
+                        args.csv = ""
+                        args.csv_replace_day = False
                     code = cmd_summary(token, args)
                 elif action == "packages":
                     prompt_catalog_filters(args, for_summary=False)
