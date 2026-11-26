@@ -93,6 +93,18 @@ function accessRows_(state) {
   return rows;
 }
 
+/**
+ * Set at the start of editor and clock-trigger entry points.
+ * Those runs have no web visitor, and Apps Script's error stack does not
+ * name the caller, so the web-app check cannot see that this is the owner.
+ * One execution only. doGet and the api* functions never set this.
+ */
+var ACCESS_TRUST_RUNTIME_ = false;
+
+function trustRuntimeOwner_() {
+  ACCESS_TRUST_RUNTIME_ = true;
+}
+
 function accessGate_() {
   var props = PropertiesService.getScriptProperties();
   var state = loadAccess_(props);
@@ -106,8 +118,23 @@ function accessGate_() {
   };
 }
 
+/** Editor and triggers: no visitor email. The script account, or the configured owner, is enough. */
+function approveRuntimeOwner_(gate) {
+  if (visitorEmail_()) return gate;
+  var candidate = scriptOwnerEmail_() || normalizeAccessEmail_(ACCESS_OWNER_EMAIL);
+  if (candidate && gate.users.indexOf(candidate) !== -1) {
+    gate.email = candidate;
+    gate.approved = true;
+    gate.admin = candidate === gate.adminEmail;
+  }
+  return gate;
+}
+
 function requireApproved_() {
   var gate = accessGate_();
+  if (!gate.approved && ACCESS_TRUST_RUNTIME_) {
+    gate = approveRuntimeOwner_(gate);
+  }
   if (!gate.approved) {
     throw new Error("You do not have access to this app.");
   }

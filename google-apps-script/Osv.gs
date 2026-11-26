@@ -28,14 +28,17 @@ var OSV_TREES = [
 ];
 
 function syncOsvIndex() {
+  trustRuntimeOwner_();
   return syncOsvIndex_(false);
 }
 
 function syncOsvIndexForce() {
+  trustRuntimeOwner_();
   return syncOsvIndex_(true);
 }
 
 function syncOsvIndexContinue_() {
+  trustRuntimeOwner_();
   return syncOsvIndex_(false);
 }
 

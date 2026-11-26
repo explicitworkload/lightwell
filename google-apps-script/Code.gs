@@ -241,6 +241,7 @@ function webAppHref_(opts, maybeKey) {
 }
 
 function runCatalogSnapshot() {
+  trustRuntimeOwner_();
   requireApproved_();
   var result = runCatalogSnapshot_();
   Logger.log(
@@ -267,6 +268,7 @@ function runCatalogSnapshot_() {
 
 /** Install daily triggers (idempotent). OSV index and snapshot at 08:00 and 15:00 SGT. */
 function installTriggers() {
+  trustRuntimeOwner_();
   requireApproved_();
   removeTriggers_();
   ScriptApp.newTrigger("syncOsvIndex")
@@ -301,6 +303,7 @@ function installTriggers() {
 }
 
 function removeTriggers() {
+  trustRuntimeOwner_();
   requireApproved_();
   removeTriggers_();
   Logger.log("Removed all project triggers");
