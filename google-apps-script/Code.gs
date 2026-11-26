@@ -15,6 +15,9 @@
  *   WRITE_HTML         = true|false                        (default true if folder set)
  *   WEBAPP_KEY         = optional shared secret; if set, require ?key=... on doGet
  *   CHART_DAYS         = 30                                (optional; trend window)
+ *   LW_USER            = registry username (e.g. 1234567|name) for packages.redhat.com
+ *   LW_TOKEN           = registry token (Basic Auth password) — registry proxy + OSV index
+ *   OSV_INDEX_FILE_ID  = Drive file id for osv-severity-index.json (set by syncOsvIndex)
  */
 
 var SSO_TOKEN_URL =
@@ -55,21 +58,44 @@ function titleCase_(text) {
 /**
  * Web app entrypoint (Deploy → Web app → execute as Me).
  *
- *   GET /exec                 → dashboard (Sheet only; no API call)
- *   GET /exec?action=status   → same as default
- *   GET /exec?action=run      → fetch snapshot, then dashboard
- *   GET /exec?key=SECRET      → required when Script Property WEBAPP_KEY is set
+ *   GET /exec                      → dashboard
+ *   GET /exec?page=browser         → Catalog Browser
+ *   GET /exec?page=recent          → Recent Releases (newest 300)
+ *   GET /exec?page=cve             → CVE / RHLW Lookup
+ *   GET /exec?page=match           → Dependency Match
+ *   GET /exec?page=registry&path=lightwell/…  → packages.redhat.com proxy (LW_USER / LW_TOKEN)
+ *   GET /exec?action=run           → snapshot then dashboard
+ *   GET /exec?key=SECRET           → when WEBAPP_KEY is set
  */
 function doGet(e) {
   e = e || { parameter: {} };
   var params = e.parameter || {};
   var props = PropertiesService.getScriptProperties();
+  var linkKey = params.key || "";
 
   var requiredKey = props.getProperty("WEBAPP_KEY");
   if (requiredKey && params.key !== requiredKey) {
-    return HtmlService.createHtmlOutput(
-      errorPage_("Unauthorized", "Missing or invalid <code>key</code> query parameter.")
-    ).setTitle("Unauthorized");
+    return htmlOutput_(
+      errorPage_("Unauthorized", "Missing or invalid <code>key</code> query parameter.", linkKey),
+      "Unauthorized"
+    );
+  }
+
+  var page = String(params.page || "dashboard").toLowerCase();
+  if (page === "browser") {
+    return serveHtmlPage_("Browser", linkKey, "Lightwell Catalog Browser");
+  }
+  if (page === "recent") {
+    return serveHtmlPage_("Recent", linkKey, "Lightwell Recent Releases");
+  }
+  if (page === "cve") {
+    return serveHtmlPage_("Cve", linkKey, "Lightwell CVE / RHLW Lookup");
+  }
+  if (page === "match") {
+    return serveHtmlPage_("Match", linkKey, "Lightwell Dependency Match");
+  }
+  if (page === "registry") {
+    return serveRegistryProxy_(params, linkKey);
   }
 
   var action = (params.action || "status").toLowerCase();
@@ -82,27 +108,106 @@ function doGet(e) {
     if (!isFinite(chartDays) || chartDays < 1) {
       chartDays = DEFAULT_CHART_DAYS;
     }
-    return HtmlService.createHtmlOutput(
+    return htmlOutput_(
       buildCatalogPage_(allRows, {
         source: "Google Apps Script Web app",
         chartDays: chartDays,
+        webAppKey: linkKey,
         notice:
           action === "run"
             ? "Fresh snapshot written, then dashboard refreshed from the Sheet."
             : "",
-      })
-    )
-      .setTitle(PAGE_TITLE)
-      .addMetaTag("viewport", "width=device-width, initial-scale=1");
+      }),
+      PAGE_TITLE
+    );
   } catch (err) {
     Logger.log(err);
-    return HtmlService.createHtmlOutput(
+    return htmlOutput_(
       errorPage_(
-        "Snapshot failed",
-        "<pre>" + esc_(String(err && err.message ? err.message : err)) + "</pre>"
-      )
-    ).setTitle("Snapshot failed");
+        "Snapshot Failed",
+        "<pre>" + esc_(String(err && err.message ? err.message : err)) + "</pre>",
+        linkKey
+      ),
+      "Snapshot Failed"
+    );
   }
+}
+
+/** Include an HTML file from the Apps Script project (for templates). */
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+function serveHtmlPage_(filename, linkKey, title) {
+  var tpl = HtmlService.createTemplateFromFile(filename);
+  tpl.urlDashboard = webAppHref_({ key: linkKey });
+  tpl.urlBrowser = webAppHref_({ page: "browser", key: linkKey });
+  tpl.urlRecent = webAppHref_({ page: "recent", key: linkKey });
+  tpl.urlCve = webAppHref_({ page: "cve", key: linkKey });
+  tpl.urlMatch = webAppHref_({ page: "match", key: linkKey });
+  tpl.webAppKey = linkKey || "";
+  var base = "";
+  try {
+    base = ScriptApp.getService().getUrl() || "";
+  } catch (err) {
+    base = "";
+  }
+  if (!base && tpl.urlBrowser) {
+    base = String(tpl.urlBrowser).split("?")[0];
+  }
+  tpl.webAppBase = base;
+  var out = tpl.evaluate();
+  out.setTitle(title || PAGE_TITLE);
+  out.addMetaTag("viewport", "width=device-width, initial-scale=1");
+  out.setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  return out;
+}
+
+/** HtmlService output with iframe-safe settings (avoids blank white pages on nav). */
+function htmlOutput_(html, title) {
+  return HtmlService.createHtmlOutput(html)
+    .setTitle(title || PAGE_TITLE)
+    .addMetaTag("viewport", "width=device-width, initial-scale=1")
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/**
+ * Absolute Web app URL.
+ * opts: { action, page, key }  OR legacy webAppHref_(action, key)
+ * Always use target="_top" on these links (Apps Script iframe).
+ */
+function webAppHref_(opts, maybeKey) {
+  if (typeof opts === "string") {
+    opts = { action: opts, key: maybeKey || "" };
+  }
+  opts = opts || {};
+  var base = "";
+  try {
+    base = ScriptApp.getService().getUrl() || "";
+  } catch (err) {
+    base = "";
+  }
+  var q = [];
+  if (opts.page) {
+    q.push("page=" + encodeURIComponent(opts.page));
+  }
+  if (opts.action) {
+    q.push("action=" + encodeURIComponent(opts.action));
+  }
+  if (opts.key) {
+    q.push("key=" + encodeURIComponent(opts.key));
+  }
+  // Prefer path= over u= — nested https:// in query breaks Google's web-app router (Drive error page).
+  if (opts.path) {
+    q.push("path=" + encodeURIComponent(opts.path));
+  } else if (opts.p) {
+    q.push("path=" + encodeURIComponent(opts.p));
+  }
+  if (opts.u && !opts.path && !opts.p) {
+    q.push("u=" + encodeURIComponent(opts.u));
+  }
+  var query = q.length ? "?" + q.join("&") : "";
+  return (base || "") + query;
 }
 
 function runCatalogSnapshot() {
@@ -128,9 +233,23 @@ function runCatalogSnapshot_() {
   };
 }
 
-/** Install 08:00 and 15:00 Asia/Singapore daily triggers (idempotent). */
+/** Install daily triggers (idempotent). OSV index and snapshot at 08:00 and 15:00 SGT. */
 function installTriggers() {
   removeTriggers_();
+  ScriptApp.newTrigger("syncOsvIndex")
+    .timeBased()
+    .atHour(8)
+    .nearMinute(0)
+    .everyDays(1)
+    .inTimezone("Asia/Singapore")
+    .create();
+  ScriptApp.newTrigger("syncOsvIndex")
+    .timeBased()
+    .atHour(15)
+    .nearMinute(0)
+    .everyDays(1)
+    .inTimezone("Asia/Singapore")
+    .create();
   ScriptApp.newTrigger("runCatalogSnapshot")
     .timeBased()
     .atHour(8)
@@ -145,7 +264,7 @@ function installTriggers() {
     .everyDays(1)
     .inTimezone("Asia/Singapore")
     .create();
-  Logger.log("Installed 08:00 and 15:00 Asia/Singapore triggers for runCatalogSnapshot");
+  Logger.log("Installed SGT triggers: syncOsvIndex and runCatalogSnapshot at 08:00 and 15:00");
 }
 
 function removeTriggers() {
@@ -376,13 +495,25 @@ function maybeWriteHtml_(props) {
 }
 
 /**
- * Full dashboard HTML (matches lightwell_catalog_daily.py layout + 30d chart).
- * options: { source, chartDays, notice }
+ * Full dashboard HTML.
+ * options: { source, chartDays, notice, webAppKey }
+ * Times/filters are applied in the browser (local timezone).
  */
 function buildCatalogPage_(allRows, options) {
   options = options || {};
-  var chartDays = options.chartDays || DEFAULT_CHART_DAYS;
-  var generated = formatDisplayStamp_(new Date());
+  var chartDays = Number(options.chartDays || DEFAULT_CHART_DAYS);
+  if (!isFinite(chartDays)) {
+    chartDays = DEFAULT_CHART_DAYS;
+  }
+  chartDays = Math.max(7, Math.min(365, Math.round(chartDays)));
+  var webAppKey = options.webAppKey || "";
+  var hrefStatus = webAppHref_({ action: "status", key: webAppKey });
+  var hrefRun = webAppHref_({ action: "run", key: webAppKey });
+  var hrefBrowser = webAppHref_({ page: "browser", key: webAppKey });
+  var hrefRecent = webAppHref_({ page: "recent", key: webAppKey });
+  var hrefCve = webAppHref_({ page: "cve", key: webAppKey });
+  var hrefMatch = webAppHref_({ page: "match", key: webAppKey });
+  var generatedIso = formatStampSgt_(new Date());
 
   var latestAt = "";
   allRows.forEach(function (r) {
@@ -390,7 +521,6 @@ function buildCatalogPage_(allRows, options) {
       latestAt = String(r[0]);
     }
   });
-  var latestDisplay = latestAt ? formatDisplayStamp_(latestAt) : "—";
 
   var latestRows = allRows.filter(function (r) {
     return String(r[0]) === latestAt;
@@ -435,13 +565,12 @@ function buildCatalogPage_(allRows, options) {
     latestBody = '<tr><td colspan="4">No Rows</td></tr>';
   }
 
-  var historyCount = allRows.length;
   var historyBody = allRows
     .slice()
     .reverse()
     .map(function (r) {
       var stamp = String(r[0]);
-      var cls = stamp === latestAt ? " class='latest'" : "";
+      var cls = stamp === latestAt ? " class='latest hist-row'" : " class='hist-row'";
       var level = String(r[2] || "");
       var levelClass =
         level === "validated"
@@ -452,8 +581,12 @@ function buildCatalogPage_(allRows, options) {
       return (
         "<tr" +
         cls +
-        "><td class='stamp'>" +
-        esc_(formatDisplayStamp_(stamp)) +
+        " data-iso='" +
+        esc_(stamp) +
+        "'><td class='stamp js-local-time' data-iso='" +
+        esc_(stamp) +
+        "'>" +
+        esc_(stamp) +
         "</td><td>" +
         esc_(titleCase_(r[1])) +
         "</td><td><span class='" +
@@ -472,23 +605,54 @@ function buildCatalogPage_(allRows, options) {
     historyBody = '<tr class="empty"><td colspan="5">No Rows</td></tr>';
   }
 
-  var chart = buildChartPayload_(allRows, chartDays);
-  chart.labels = chart.labels.map(formatChartDayLabel_);
-  var chartJson = JSON.stringify(chart).replace(/</g, "\\u003c");
+  var catalogPayload = {
+    rows: allRows.map(function (r) {
+      return {
+        t: String(r[0] || ""),
+        ecosystem: String(r[1] || ""),
+        level: String(r[2] || ""),
+        packages: Number(r[3]) || 0,
+        versions: Number(r[4]) || 0,
+      };
+    }),
+    latestAt: latestAt,
+    defaultDays: chartDays,
+    pageSize: DEFAULT_HISTORY_PAGE_SIZE,
+    series: ECOSYSTEMS.map(function (eco) {
+      return SECURITY_LEVELS.map(function (level) {
+        var key = eco + "|" + level;
+        return {
+          key: key,
+          label: eco + " · " + level,
+          color: SERIES_COLORS[key] || "#a1a1aa",
+        };
+      });
+    }).reduce(function (a, b) {
+      return a.concat(b);
+    }, []),
+  };
+  var catalogJson = JSON.stringify(catalogPayload).replace(/</g, "\\u003c");
+
   var notice = options.notice
     ? "<div class='notice' role='status'>" + esc_(options.notice) + "</div>"
     : "";
-  var chartRange = chart.labels.length
-    ? esc_(chart.labels[0]) +
-      " → " +
-      esc_(chart.labels[chart.labels.length - 1]) +
-      " · " +
-      chart.labels.length +
-      " Snapshot" +
-      (chart.labels.length === 1 ? "" : "s")
-    : "No Snapshot Data In This Window Yet — Run A Few Days Of Triggers First.";
-  var trendHeading =
-    "Package Trend (Last " + chartDays + " Days)";
+
+  var dayPresets = [7, 14, 30, 365];
+  var segButtons = dayPresets
+    .map(function (d) {
+      return (
+        "<button type='button' class='seg-btn" +
+        (d === chartDays ? " is-active" : "") +
+        "' data-days='" +
+        d +
+        "' aria-pressed='" +
+        (d === chartDays ? "true" : "false") +
+        "'>" +
+        d +
+        "D</button>"
+      );
+    })
+    .join("");
 
   return (
     "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'/>" +
@@ -497,6 +661,7 @@ function buildCatalogPage_(allRows, options) {
     "<title>" +
     esc_(PAGE_TITLE) +
     "</title>" +
+    "<link rel='icon' href='https://www.redhat.com/favicon.ico' type='image/x-icon'/>" +
     "<link rel='preconnect' href='https://fonts.googleapis.com'/>" +
     "<link rel='preconnect' href='https://fonts.gstatic.com' crossorigin/>" +
     "<link href='https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap' rel='stylesheet'/>" +
@@ -507,45 +672,77 @@ function buildCatalogPage_(allRows, options) {
     "<div class='glow glow-a' aria-hidden='true'></div>" +
     "<div class='glow glow-b' aria-hidden='true'></div>" +
     "<main class='fade-in'>" +
+    "<nav class='topnav' aria-label='Primary'>" +
+    "<a class='is-active' href='" +
+    esc_(hrefStatus) +
+    "' target='_top' rel='noopener'>Dashboard</a>" +
+    "<a href='" +
+    esc_(hrefBrowser) +
+    "' target='_top' rel='noopener'>Catalog Browser</a>" +
+    "<a href='" +
+    esc_(hrefRecent) +
+    "' target='_top' rel='noopener'>Recent Releases</a>" +
+    "<a href='" +
+    esc_(hrefCve) +
+    "' target='_top' rel='noopener'>CVE / RHLW Lookup</a>" +
+    "<a href='" +
+    esc_(hrefMatch) +
+    "' target='_top' rel='noopener'>Dependency Match</a>" +
+    "</nav>" +
     "<header class='hero'>" +
     "<div class='hero-copy'>" +
-    "<p class='eyebrow'>Lightwell Network · SGT</p>" +
+    "<p class='eyebrow'>Lightwell Network · <span id='tzLabel'>Local Time</span></p>" +
     "<h1>" +
     esc_(PAGE_TITLE) +
     "</h1>" +
-    "<p class='sub'>Package And Version Counts From Content-Sources <code>meta.count</code>. " +
-    "Latest Snapshot <strong>" +
-    esc_(latestDisplay) +
+    "<p class='sub'>Package And Version Counts From Content-Sources <code>meta.count</code>.</p>" +
+    "<p class='latest-line'>Latest Snapshot<br/><strong class='js-local-time' data-iso='" +
+    esc_(latestAt || "") +
+    "' data-empty='—'>" +
+    esc_(latestAt || "—") +
     "</strong></p>" +
     "</div>" +
     "<div class='hero-actions'>" +
-    "<a class='btn btn-ghost' href='?action=status'>Refresh</a>" +
-    "<a class='btn btn-primary' href='?action=run'>Run Snapshot</a>" +
+    "<a class='btn btn-ghost' href='" +
+    esc_(hrefStatus) +
+    "' target='_top' rel='noopener'>Refresh</a>" +
+    "<a class='btn btn-primary' href='" +
+    esc_(hrefRun) +
+    "' target='_top' rel='noopener'>Run Snapshot</a>" +
     "</div>" +
     "</header>" +
     notice +
-    "<div class='stats'>" +
+    "<div class='stats stats-3'>" +
     "<article class='stat'><p class='stat-label'>Total Packages</p><p class='stat-value'>" +
     num(totalPackages) +
     "</p></article>" +
     "<article class='stat'><p class='stat-label'>Total Versions</p><p class='stat-value'>" +
     num(totalVersions) +
     "</p></article>" +
-    "<article class='stat'><p class='stat-label'>History Rows</p><p class='stat-value'>" +
-    num(historyCount) +
-    "</p></article>" +
-    "<article class='stat'><p class='stat-label'>Trend Window</p><p class='stat-value'>" +
+    "<article class='stat'><p class='stat-label'>Trend Window</p><p class='stat-value' id='statTrend'>" +
     chartDays +
     "d</p></article>" +
     "</div>" +
     "<section class='panel'>" +
-    "<div class='section-head'>" +
-    "<h2>" +
-    esc_(trendHeading) +
-    "</h2>" +
-    "<p class='chart-sub'>" +
-    chartRange +
-    "</p>" +
+    "<div class='section-head section-head-stack'>" +
+    "<div class='section-title-row'>" +
+    "<h2 id='trendHeading'>Package Trend</h2>" +
+    "<div class='seg' role='group' aria-label='Trend Window Presets'>" +
+    segButtons +
+    "</div>" +
+    "</div>" +
+    "<div class='range-row'>" +
+    "<label class='range-label' for='trendRange'>Window</label>" +
+    "<input type='range' id='trendRange' class='range' min='7' max='365' step='1' value='" +
+    chartDays +
+    "' aria-valuemin='7' aria-valuemax='365' aria-valuenow='" +
+    chartDays +
+    "' aria-label='Trend window days'/>" +
+    "<span class='range-value' id='trendRangeValue'>" +
+    chartDays +
+    "d</span>" +
+    "</div>" +
+    "<p class='chart-sub' id='chartRange'>Loading trend…</p>" +
     "</div>" +
     "<div class='chart-wrap'><canvas id='catalogChart'></canvas></div>" +
     "</section>" +
@@ -558,88 +755,25 @@ function buildCatalogPage_(allRows, options) {
     latestBody +
     "</tbody></table></div></section>" +
     "<section class='panel'>" +
-    "<div class='section-head'>" +
+    "<div class='section-head section-head-stack'>" +
+    "<div class='section-title-row'>" +
     "<h2>History</h2>" +
-    (historyCount
-      ? "<p class='chart-sub' id='historyCountLabel'>" +
-        historyCount +
-        " Row" +
-        (historyCount === 1 ? "" : "s") +
-        "</p>"
-      : "") +
+    "<p class='chart-sub' id='historyCountLabel'></p>" +
+    "</div>" +
+    "<div class='date-filters'>" +
+    "<label class='date-field'>From" +
+    "<input type='date' id='histFrom' /></label>" +
+    "<label class='date-field'>To" +
+    "<input type='date' id='histTo' /></label>" +
+    "<button type='button' class='btn-text' id='histClearDates'>Clear</button>" +
+    "</div>" +
     "</div>" +
     "<div class='table-wrap'><table id='historyTable'><thead><tr>" +
-    "<th>Snapshot (SGT)</th><th>Ecosystem</th><th>Security Level</th>" +
+    "<th>Snapshot</th><th>Ecosystem</th><th>Security Level</th>" +
     "<th class='num'>Packages</th><th class='num'>Versions</th>" +
     "</tr></thead><tbody id='historyBody'>" +
     historyBody +
     "</tbody></table></div>" +
-    historyPagerHtml_(DEFAULT_HISTORY_PAGE_SIZE) +
-    "</section>" +
-    "<footer><span>Generated " +
-    esc_(generated) +
-    "</span><span class='dot'>·</span><span>" +
-    esc_(options.source || "Catalog") +
-    "</span></footer>" +
-    "<script>" +
-    "const chartPayload = " +
-    chartJson +
-    ";" +
-    "const ctx = document.getElementById('catalogChart');" +
-    "if (ctx && chartPayload.labels.length && window.Chart) {" +
-    "  Chart.defaults.color = '#9ca3af';" +
-    "  Chart.defaults.borderColor = 'rgba(255,255,255,0.06)';" +
-    "  new Chart(ctx, {" +
-    "    type: 'line'," +
-    "    data: {" +
-    "      labels: chartPayload.labels," +
-    "      datasets: chartPayload.datasets.map(function (ds) {" +
-    "        return {" +
-    "          label: ds.label," +
-    "          data: ds.data," +
-    "          borderColor: ds.color," +
-    "          backgroundColor: ds.color," +
-    "          tension: 0.35," +
-    "          pointRadius: chartPayload.labels.length > 40 ? 0 : 3," +
-    "          pointHoverRadius: 5," +
-    "          borderWidth: 2.25," +
-    "          spanGaps: true" +
-    "        };" +
-    "      })" +
-    "    }," +
-    "    options: {" +
-    "      responsive: true," +
-    "      maintainAspectRatio: false," +
-    "      interaction: { mode: 'index', intersect: false }," +
-    "      plugins: {" +
-    "        legend: { position: 'bottom', labels: { boxWidth: 10, usePointStyle: true, color: '#9ca3af', padding: 16, font: { family: 'Manrope', size: 12 } } }," +
-    "        tooltip: {" +
-    "          backgroundColor: '#0a0a0a'," +
-    "          titleColor: '#fafafa'," +
-    "          bodyColor: '#d4d4d8'," +
-    "          borderColor: '#27272a'," +
-    "          borderWidth: 1," +
-    "          padding: 12," +
-    "          callbacks: { label: function (c) {" +
-    "            var v = c.parsed.y; return c.dataset.label + ': ' + (v == null ? '—' : Number(v).toLocaleString('en-US'));" +
-    "          }}" +
-    "        }" +
-    "      }," +
-    "      scales: {" +
-    "        x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 10, color: '#9ca3af' }, grid: { color: 'rgba(255,255,255,0.04)' } }," +
-    "        y: { beginAtZero: true, ticks: { color: '#9ca3af', callback: function (v) { return Number(v).toLocaleString('en-US'); } }, grid: { color: 'rgba(255,255,255,0.04)' } }" +
-    "      }" +
-    "    }" +
-    "  });" +
-    "}" +
-    historyPagerScript_(DEFAULT_HISTORY_PAGE_SIZE) +
-    "</script>" +
-    "</main></body></html>"
-  );
-}
-
-function historyPagerHtml_(pageSize) {
-  return (
     "<nav class='pager' id='historyPager' aria-label='History pagination' hidden>" +
     "<button type='button' id='histPrev'>Previous</button>" +
     "<span id='histPageLabel'></span>" +
@@ -652,117 +786,220 @@ function historyPagerHtml_(pageSize) {
           "<option value='" +
           n +
           "'" +
-          (n === pageSize ? " selected" : "") +
+          (n === DEFAULT_HISTORY_PAGE_SIZE ? " selected" : "") +
           ">" +
           n +
           "</option>"
         );
       })
       .join("") +
-    "</select></label></nav>"
+    "</select></label></nav>" +
+    "</section>" +
+    "<footer><span>Generated <span class='js-local-time' data-iso='" +
+    esc_(generatedIso) +
+    "'>" +
+    esc_(generatedIso) +
+    "</span></span><span class='dot'>·</span><span>" +
+    esc_(options.source || "Catalog") +
+    "</span><span class='dot'>·</span><span id='tzFooter'></span></footer>" +
+    "<script>window.CATALOG=" +
+    catalogJson +
+    ";" +
+    dashboardClientScript_() +
+    "</script>" +
+    "</main></body></html>"
   );
 }
 
-function historyPagerScript_(pageSize) {
+/** Browser-side timezone formatting, chart day filter, history date filter + pager. */
+function dashboardClientScript_() {
   return (
-    "(function () {" +
-    "  var body = document.getElementById('historyBody');" +
-    "  var pager = document.getElementById('historyPager');" +
-    "  if (!body || !pager) return;" +
-    "  var rows = Array.prototype.slice.call(body.querySelectorAll('tr')).filter(function (tr) {" +
-    "    return !tr.classList.contains('empty');" +
+    "(function(){" +
+    "var C=window.CATALOG||{rows:[],series:[],defaultDays:30,pageSize:24};" +
+    "var tz=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';" +
+    "var tzEl=document.getElementById('tzLabel');" +
+    "var tzFoot=document.getElementById('tzFooter');" +
+    "if(tzEl) tzEl.textContent=tz;" +
+    "if(tzFoot) tzFoot.textContent=tz;" +
+    "function fmt(iso,opts){" +
+    "  var t=Date.parse(iso||'');" +
+    "  if(!isFinite(t)) return iso||'—';" +
+    "  return new Intl.DateTimeFormat(undefined,Object.assign({" +
+    "    timeZone:tz,month:'short',day:'2-digit',year:'numeric'," +
+    "    hour:'2-digit',minute:'2-digit',hour12:false" +
+    "  },opts||{})).format(new Date(t));" +
+    "}" +
+    "function localDay(iso){" +
+    "  var t=Date.parse(iso||'');" +
+    "  if(!isFinite(t)) return '';" +
+    "  var parts=new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(t));" +
+    "  var y='',m='',d='';" +
+    "  parts.forEach(function(p){ if(p.type==='year')y=p.value; if(p.type==='month')m=p.value; if(p.type==='day')d=p.value; });" +
+    "  return y+'-'+m+'-'+d;" +
+    "}" +
+    "function fmtDayLabel(day){" +
+    "  var t=Date.parse(day+'T12:00:00');" +
+    "  if(!isFinite(t)) return day;" +
+    "  return new Intl.DateTimeFormat(undefined,{timeZone:tz,month:'short',day:'2-digit'}).format(new Date(t));" +
+    "}" +
+    "document.querySelectorAll('.js-local-time').forEach(function(el){" +
+    "  var iso=el.getAttribute('data-iso')||'';" +
+    "  var empty=el.getAttribute('data-empty');" +
+    "  el.textContent=iso?fmt(iso):(empty||'—');" +
+    "});" +
+    "var chartDays=Math.max(7,Math.min(365,Number(C.defaultDays)||30));" +
+    "var chartObj=null;" +
+    "var rangeEl=document.getElementById('trendRange');" +
+    "var rangeVal=document.getElementById('trendRangeValue');" +
+    "function syncControls(days){" +
+    "  chartDays=Math.max(7,Math.min(365,Math.round(Number(days)||30)));" +
+    "  if(rangeEl){ rangeEl.value=String(chartDays); rangeEl.setAttribute('aria-valuenow',String(chartDays)); }" +
+    "  if(rangeVal) rangeVal.textContent=chartDays+'d';" +
+    "  document.querySelectorAll('.seg-btn').forEach(function(b){" +
+    "    var on=Number(b.getAttribute('data-days'))===chartDays;" +
+    "    b.classList.toggle('is-active',on);" +
+    "    b.setAttribute('aria-pressed',on?'true':'false');" +
     "  });" +
-    "  if (!rows.length) return;" +
-    "  var page = 1;" +
-    "  var pageSize = " +
-    Number(pageSize) +
-    ";" +
-    "  var prev = document.getElementById('histPrev');" +
-    "  var next = document.getElementById('histNext');" +
-    "  var label = document.getElementById('histPageLabel');" +
-    "  var sizeSel = document.getElementById('histPageSize');" +
-    "  function render() {" +
-    "    var pages = Math.max(1, Math.ceil(rows.length / pageSize));" +
-    "    if (page > pages) page = pages;" +
-    "    if (page < 1) page = 1;" +
-    "    var start = (page - 1) * pageSize;" +
-    "    var end = start + pageSize;" +
-    "    rows.forEach(function (tr, i) { tr.hidden = i < start || i >= end; });" +
-    "    var shown = Math.min(end, rows.length) - start;" +
-    "    label.textContent = 'Page ' + page + ' of ' + pages +" +
-    "      ' · ' + (start + 1) + '–' + (start + shown) + ' of ' + rows.length;" +
-    "    prev.disabled = page <= 1;" +
-    "    next.disabled = page >= pages;" +
-    "    pager.hidden = false;" +
+    "}" +
+    "function buildPayload(days){" +
+    "  var cutoff=Date.now()-days*24*60*60*1000;" +
+    "  var byStamp={}; var stamps=[];" +
+    "  (C.rows||[]).forEach(function(r){" +
+    "    var t=Date.parse(r.t||'');" +
+    "    if(!isFinite(t)||t<cutoff) return;" +
+    "    if(!byStamp[r.t]){ byStamp[r.t]={}; stamps.push(r.t); }" +
+    "    byStamp[r.t][r.ecosystem+'|'+r.level]=r.packages;" +
+    "  });" +
+    "  stamps.sort();" +
+    "  var dayLast={}; var dayOrder=[];" +
+    "  stamps.forEach(function(stamp){" +
+    "    var day=localDay(stamp); if(!day) return;" +
+    "    if(!dayLast[day]) dayOrder.push(day);" +
+    "    dayLast[day]=stamp;" +
+    "  });" +
+    "  return {" +
+    "    labels:dayOrder.map(fmtDayLabel)," +
+    "    rawDays:dayOrder," +
+    "    datasets:(C.series||[]).map(function(s){" +
+    "      return {label:s.label,color:s.color,data:dayOrder.map(function(day){" +
+    "        var map=byStamp[dayLast[day]]||{};" +
+    "        return Object.prototype.hasOwnProperty.call(map,s.key)?map[s.key]:null;" +
+    "      })};" +
+    "    })" +
+    "  };" +
+    "}" +
+    "function renderChart(days){" +
+    "  syncControls(days);" +
+    "  var el=document.getElementById('statTrend'); if(el) el.textContent=chartDays+'d';" +
+    "  var head=document.getElementById('trendHeading');" +
+    "  if(head) head.textContent='Package Trend (Last '+chartDays+' Days)';" +
+    "  var payload=buildPayload(chartDays);" +
+    "  var range=document.getElementById('chartRange');" +
+    "  if(range){" +
+    "    range.textContent=payload.labels.length" +
+    "      ? (payload.labels[0]+' → '+payload.labels[payload.labels.length-1]+' · '+payload.labels.length+' Snapshot'+(payload.labels.length===1?'':'s')+' · '+tz)" +
+    "      : 'No Snapshot Data In This Window Yet — Run A Few Days Of Triggers First.';" +
     "  }" +
-    "  prev.addEventListener('click', function () { page -= 1; render(); });" +
-    "  next.addEventListener('click', function () { page += 1; render(); });" +
-    "  sizeSel.addEventListener('change', function () {" +
-    "    pageSize = Number(sizeSel.value) || " +
-    Number(pageSize) +
-    ";" +
-    "    page = 1;" +
-    "    render();" +
+    "  var ctx=document.getElementById('catalogChart');" +
+    "  if(!ctx||!window.Chart) return;" +
+    "  if(chartObj) chartObj.destroy();" +
+    "  Chart.defaults.color='#9ca3af';" +
+    "  Chart.defaults.borderColor='rgba(255,255,255,0.06)';" +
+    "  chartObj=new Chart(ctx,{" +
+    "    type:'line'," +
+    "    data:{" +
+    "      labels:payload.labels," +
+    "      datasets:payload.datasets.map(function(ds){" +
+    "        return {label:ds.label,data:ds.data,borderColor:ds.color,backgroundColor:ds.color," +
+    "          tension:0.35,pointRadius:payload.labels.length>40?0:3,pointHoverRadius:5,borderWidth:2.25,spanGaps:true};" +
+    "      })" +
+    "    }," +
+    "    options:{" +
+    "      responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false}," +
+    "      plugins:{" +
+    "        legend:{position:'bottom',labels:{boxWidth:10,usePointStyle:true,color:'#9ca3af',padding:16,font:{family:'Manrope',size:12}}}," +
+    "        tooltip:{backgroundColor:'#0a0a0a',titleColor:'#fafafa',bodyColor:'#d4d4d8',borderColor:'#27272a',borderWidth:1,padding:12," +
+    "          callbacks:{label:function(c){var v=c.parsed.y; return c.dataset.label+': '+(v==null?'—':Number(v).toLocaleString());}}}" +
+    "      }," +
+    "      scales:{" +
+    "        x:{ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:10,color:'#9ca3af'},grid:{color:'rgba(255,255,255,0.04)'}}," +
+    "        y:{beginAtZero:true,ticks:{color:'#9ca3af',callback:function(v){return Number(v).toLocaleString();}},grid:{color:'rgba(255,255,255,0.04)'}}" +
+    "      }" +
+    "    }" +
     "  });" +
-    "  render();" +
+    "}" +
+    "document.querySelectorAll('.seg-btn').forEach(function(btn){" +
+    "  btn.addEventListener('click',function(){" +
+    "    renderChart(Number(btn.getAttribute('data-days'))||30);" +
+    "  });" +
+    "});" +
+    "if(rangeEl){" +
+    "  var slideTimer=null;" +
+    "  function onSlide(){" +
+    "    var days=Number(rangeEl.value)||30;" +
+    "    if(rangeVal) rangeVal.textContent=days+'d';" +
+    "    document.querySelectorAll('.seg-btn').forEach(function(b){" +
+    "      var on=Number(b.getAttribute('data-days'))===days;" +
+    "      b.classList.toggle('is-active',on);" +
+    "      b.setAttribute('aria-pressed',on?'true':'false');" +
+    "    });" +
+    "    clearTimeout(slideTimer);" +
+    "    slideTimer=setTimeout(function(){ renderChart(days); },80);" +
+    "  }" +
+    "  rangeEl.addEventListener('input',onSlide);" +
+    "  rangeEl.addEventListener('change',onSlide);" +
+    "}" +
+    "renderChart(chartDays);" +
+    "var allHist=Array.prototype.slice.call(document.querySelectorAll('#historyBody tr.hist-row'));" +
+    "var page=1; var pageSize=C.pageSize||24;" +
+    "var filtered=allHist.slice();" +
+    "var fromEl=document.getElementById('histFrom');" +
+    "var toEl=document.getElementById('histTo');" +
+    "var countEl=document.getElementById('historyCountLabel');" +
+    "function applyDateFilter(){" +
+    "  var from=fromEl&&fromEl.value||'';" +
+    "  var to=toEl&&toEl.value||'';" +
+    "  filtered=allHist.filter(function(tr){" +
+    "    var day=localDay(tr.getAttribute('data-iso')||'');" +
+    "    if(from&&day<from) return false;" +
+    "    if(to&&day>to) return false;" +
+    "    return true;" +
+    "  });" +
+    "  page=1; renderPager();" +
+    "}" +
+    "function renderPager(){" +
+    "  allHist.forEach(function(tr){tr.hidden=true;});" +
+    "  var pager=document.getElementById('historyPager');" +
+    "  if(!filtered.length){" +
+    "    if(countEl) countEl.textContent='0 Rows';" +
+    "    if(pager) pager.hidden=true;" +
+    "    return;" +
+    "  }" +
+    "  var pages=Math.max(1,Math.ceil(filtered.length/pageSize));" +
+    "  if(page>pages) page=pages; if(page<1) page=1;" +
+    "  var start=(page-1)*pageSize; var end=start+pageSize;" +
+    "  filtered.forEach(function(tr,i){ tr.hidden=i<start||i>=end; });" +
+    "  var shown=Math.min(end,filtered.length)-start;" +
+    "  if(countEl) countEl.textContent=filtered.length+' Row'+(filtered.length===1?'':'s');" +
+    "  var label=document.getElementById('histPageLabel');" +
+    "  if(label) label.textContent='Page '+page+' of '+pages+' · '+(start+1)+'–'+(start+shown)+' of '+filtered.length;" +
+    "  var prev=document.getElementById('histPrev'); var next=document.getElementById('histNext');" +
+    "  if(prev) prev.disabled=page<=1;" +
+    "  if(next) next.disabled=page>=pages;" +
+    "  if(pager) pager.hidden=false;" +
+    "}" +
+    "if(fromEl) fromEl.addEventListener('change',applyDateFilter);" +
+    "if(toEl) toEl.addEventListener('change',applyDateFilter);" +
+    "var clearBtn=document.getElementById('histClearDates');" +
+    "if(clearBtn) clearBtn.addEventListener('click',function(){ if(fromEl) fromEl.value=''; if(toEl) toEl.value=''; applyDateFilter(); });" +
+    "var prev=document.getElementById('histPrev'); var next=document.getElementById('histNext');" +
+    "var sizeSel=document.getElementById('histPageSize');" +
+    "if(prev) prev.addEventListener('click',function(){ page-=1; renderPager(); });" +
+    "if(next) next.addEventListener('click',function(){ page+=1; renderPager(); });" +
+    "if(sizeSel) sizeSel.addEventListener('change',function(){ pageSize=Number(sizeSel.value)||24; page=1; renderPager(); });" +
+    "applyDateFilter();" +
     "})();"
   );
-}
-
-function buildChartPayload_(allRows, chartDays) {
-  var cutoffMs = Date.now() - chartDays * 24 * 60 * 60 * 1000;
-  var byStamp = {};
-  var stamps = [];
-
-  allRows.forEach(function (r) {
-    var stamp = String(r[0] || "");
-    if (!stamp) {
-      return;
-    }
-    var t = Date.parse(stamp);
-    if (!isFinite(t) || t < cutoffMs) {
-      return;
-    }
-    if (!byStamp[stamp]) {
-      byStamp[stamp] = {};
-      stamps.push(stamp);
-    }
-    byStamp[stamp][r[1] + "|" + r[2]] = Number(r[3]) || 0;
-  });
-
-  stamps.sort();
-  // Prefer one point per SGT calendar day (keep last snapshot that day)
-  var dayLast = {};
-  var dayOrder = [];
-  stamps.forEach(function (stamp) {
-    var day = stampToSgtDay_(stamp);
-    if (!day) {
-      return;
-    }
-    if (!dayLast[day]) {
-      dayOrder.push(day);
-    }
-    dayLast[day] = stamp;
-  });
-
-  var labels = dayOrder.slice();
-  var datasets = [];
-  ECOSYSTEMS.forEach(function (eco) {
-    SECURITY_LEVELS.forEach(function (level) {
-      var key = eco + "|" + level;
-      datasets.push({
-        label: eco + " · " + level,
-        color: SERIES_COLORS[key] || "#57534e",
-        data: labels.map(function (day) {
-          var stamp = dayLast[day];
-          var map = byStamp[stamp] || {};
-          return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
-        }),
-      });
-    });
-  });
-
-  return { labels: labels, datasets: datasets };
 }
 
 function catalogCss_() {
@@ -776,12 +1013,17 @@ function catalogCss_() {
     "main{position:relative;z-index:1;max-width:1080px;margin:0 auto;padding:2rem 1.25rem 4rem}" +
     ".fade-in{animation:rise .55s ease both}" +
     "@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}" +
+    ".topnav{display:flex;flex-wrap:wrap;gap:.4rem;margin:0 0 1.35rem;padding:.35rem;border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.03);width:fit-content;max-width:100%}" +
+    ".topnav a{text-decoration:none;color:var(--muted);font-weight:700;font-size:.82rem;letter-spacing:.02em;padding:.48rem .9rem;border-radius:999px}" +
+    ".topnav a:hover{color:var(--ink);text-decoration:none}" +
+    ".topnav a.is-active{background:rgba(74,222,128,.16);color:#bbf7d0}" +
     ".hero{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:1.25rem 1.5rem;margin-bottom:1.5rem;padding-bottom:1.35rem;border-bottom:1px solid var(--line)}" +
     ".hero-copy{flex:1 1 18rem;min-width:0}" +
     ".eyebrow{margin:0 0 .65rem;font-size:.7rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)}" +
     "h1{font-family:Sora,ui-sans-serif,sans-serif;font-weight:700;font-size:clamp(1.65rem,3.2vw,2.4rem);margin:0 0 .65rem;letter-spacing:-.035em;line-height:1.12}" +
     ".sub{color:var(--muted);margin:0;max-width:40rem;font-size:.98rem}" +
-    ".sub strong{color:var(--ink);font-weight:700}" +
+    ".latest-line{margin:.85rem 0 0;color:var(--muted);font-size:.92rem;line-height:1.45}" +
+    ".latest-line strong{display:inline-block;margin-top:.2rem;color:var(--ink);font-family:Sora,ui-sans-serif,sans-serif;font-size:1.05rem;font-weight:700;letter-spacing:-.02em}" +
     ".hero-actions{display:flex;flex-wrap:wrap;gap:.6rem}" +
     ".btn{display:inline-flex;align-items:center;justify-content:center;font:inherit;font-weight:600;font-size:.9rem;text-decoration:none;border-radius:999px;padding:.62rem 1.05rem;border:1px solid transparent;transition:transform .15s ease,background .15s ease,border-color .15s ease}" +
     ".btn:hover{transform:translateY(-1px);text-decoration:none}" +
@@ -791,17 +1033,38 @@ function catalogCss_() {
     ".btn-ghost:hover{border-color:rgba(255,255,255,.2);background:rgba(255,255,255,.06)}" +
     "code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em;color:#e5e7eb;background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:6px;padding:.1rem .35rem}" +
     ".notice{background:rgba(74,222,128,.08);border:1px solid rgba(74,222,128,.25);border-radius:14px;padding:.8rem 1rem;margin:0 0 1.15rem;color:#bbf7d0;font-size:.92rem}" +
-    ".stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem;margin-bottom:1.15rem}" +
-    "@media (max-width:820px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}" +
+    ".stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-bottom:1.15rem}" +
+    ".stats-3{grid-template-columns:repeat(3,minmax(0,1fr))}" +
+    "@media (max-width:820px){.stats,.stats-3{grid-template-columns:repeat(2,minmax(0,1fr))}}" +
+    "@media (max-width:520px){.stats,.stats-3{grid-template-columns:1fr}}" +
     ".stat{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1rem 1.05rem;backdrop-filter:blur(10px)}" +
     ".stat-label{margin:0;color:var(--muted);font-size:.72rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}" +
     ".stat-value{margin:.35rem 0 0;font-family:Sora,ui-sans-serif,sans-serif;font-size:1.45rem;font-weight:700;letter-spacing:-.03em;font-variant-numeric:tabular-nums}" +
     ".panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:1.2rem 1.25rem 1.3rem;margin-bottom:1rem;backdrop-filter:blur(12px);box-shadow:0 20px 50px rgba(0,0,0,.35)}" +
     "h2{margin:0 0 .85rem;font-family:Sora,ui-sans-serif,sans-serif;font-size:1.02rem;font-weight:600;letter-spacing:-.02em;color:var(--ink)}" +
     ".section-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:.5rem .85rem;margin-bottom:.55rem}" +
+    ".section-head-stack{flex-direction:column;align-items:stretch;gap:.75rem}" +
+    ".section-title-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.65rem .85rem}" +
     ".section-head h2{margin:0}" +
     ".section-head .chart-sub{margin:0}" +
     ".chart-sub{margin:-.2rem 0 .85rem;color:var(--muted);font-size:.88rem}" +
+    ".seg{display:inline-flex;padding:3px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid var(--line);gap:2px}" +
+    ".seg-btn{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-weight:700;font-size:.78rem;letter-spacing:.04em;padding:.42rem .78rem;border-radius:999px;cursor:pointer;transition:background .15s ease,color .15s ease}" +
+    ".seg-btn:hover{color:var(--ink)}" +
+    ".seg-btn.is-active{background:rgba(74,222,128,.16);color:#bbf7d0}" +
+    ".range-row{display:flex;align-items:center;gap:.75rem;margin:.15rem 0 .15rem}" +
+    ".range-label{font-size:.72rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);min-width:3.5rem}" +
+    ".range-value{font-family:Sora,ui-sans-serif,sans-serif;font-weight:700;font-variant-numeric:tabular-nums;min-width:3.2rem;text-align:right;color:var(--ink)}" +
+    ".range{flex:1;appearance:none;height:6px;border-radius:999px;background:linear-gradient(90deg,rgba(74,222,128,.35),rgba(56,189,248,.35));outline:none;cursor:pointer}" +
+    ".range::-webkit-slider-thumb{appearance:none;width:18px;height:18px;border-radius:50%;background:#4ade80;border:2px solid #052e16;box-shadow:0 0 0 4px rgba(74,222,128,.18);cursor:grab}" +
+    ".range::-webkit-slider-thumb:active{cursor:grabbing}" +
+    ".range::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#4ade80;border:2px solid #052e16;box-shadow:0 0 0 4px rgba(74,222,128,.18);cursor:grab}" +
+    ".range::-moz-range-track{height:6px;border-radius:999px;background:linear-gradient(90deg,rgba(74,222,128,.35),rgba(56,189,248,.35))}" +
+    ".date-filters{display:flex;flex-wrap:wrap;align-items:end;gap:.65rem .75rem}" +
+    ".date-field{display:flex;flex-direction:column;gap:.28rem;font-size:.72rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}" +
+    ".date-field input[type=date]{font:inherit;font-size:.9rem;font-weight:600;letter-spacing:0;text-transform:none;color:var(--ink);background:#0a0a0a;border:1px solid var(--line);border-radius:10px;padding:.48rem .65rem;min-width:9.5rem;color-scheme:dark}" +
+    ".btn-text{appearance:none;border:0;background:transparent;color:var(--accent);font:inherit;font-weight:600;font-size:.88rem;cursor:pointer;padding:.45rem .2rem}" +
+    ".btn-text:hover{text-decoration:underline}" +
     ".chart-wrap{position:relative;height:min(380px,58vw);width:100%}" +
     ".table-wrap{overflow-x:auto;border-radius:12px;border:1px solid var(--line)}" +
     "table{width:100%;border-collapse:collapse;font-size:.93rem}" +
@@ -829,22 +1092,28 @@ function catalogCss_() {
   );
 }
 
-function errorPage_(title, messageHtml) {
+function errorPage_(title, messageHtml, webAppKey) {
+  var hrefStatus = webAppHref_({ action: "status", key: webAppKey || "" });
   return (
     "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'/>" +
     "<meta name='viewport' content='width=device-width, initial-scale=1'/>" +
     "<title>" +
     esc_(title) +
-    "</title><style>" +
+    "</title>" +
+    "<link rel='icon' href='https://www.redhat.com/favicon.ico' type='image/x-icon'/>" +
+    "<style>" +
     catalogCss_() +
-    "</style></head><body><main>" +
+    "</style></head><body><div class='glow glow-a' aria-hidden='true'></div>" +
+    "<main class='fade-in'>" +
     "<h1>" +
     esc_(title) +
     "</h1>" +
-    "<section>" +
+    "<section class='panel'>" +
     messageHtml +
     "</section>" +
-    "<footer><a href='?action=status'>Back to dashboard</a></footer>" +
+    "<footer><a href='" +
+    esc_(hrefStatus) +
+    "' target='_top' rel='noopener'>Back To Dashboard</a></footer>" +
     "</main></body></html>"
   );
 }

@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Lightwell CVE / RHLW Lookup</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <div class="glow glow-a" aria-hidden="true"></div>
+  <div class="glow glow-b" aria-hidden="true"></div>
+  <main>
+    <nav class="topnav" aria-label="Primary">
+      <a href="<?= urlDashboard ?>" target="_top">Dashboard</a>
+      <a href="<?= urlBrowser ?>" target="_top">Catalog Browser</a>
+      <a href="<?= urlRecent ?>" target="_top">Recent Releases</a>
+      <a class="is-active" href="<?= urlCve ?>" target="_top">CVE / RHLW Lookup</a>
+      <a href="<?= urlMatch ?>" target="_top">Dependency Match</a>
+    </nav>
+
+    <p class="eyebrow">OSV · Advisories</p>
+    <h1>CVE / RHLW Lookup</h1>
+    <p class="sub">Search Lightwell advisories by CVE id, <code>RHLW-</code> id, package name, or remediated release.</p>
+
+    <section class="panel">
+      <div class="toolbar">
+        <label class="field grow">
+          Search
+          <input id="query" type="text" placeholder="CVE-2023-51074, RHLW-2026-…, json-path, or 2.8.0.rhlw-00001" />
+        </label>
+        <label class="field">
+          Min Severity
+          <input id="sevMin" type="number" min="0" max="10" step="0.1" placeholder="optional" />
+        </label>
+        <button type="button" class="btn btn-primary" id="btnLookup">Lookup</button>
+      </div>
+      <p class="status" id="status">Enter a CVE id, an RHLW id, a package, or a release.</p>
+      <div class="layout">
+        <div class="pane pane-packages">
+          <h2>Advisories</h2>
+          <div class="table-wrap">
+            <table class="table-advisories">
+              <thead>
+                <tr>
+                  <th>Advisory</th>
+                  <th>Severity</th>
+                  <th>Package</th>
+                  <th>Fixed</th>
+                </tr>
+              </thead>
+              <tbody id="advBody">
+                <tr class="no-click"><td colspan="4" class="empty">No results yet</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="pane pane-versions" id="detailPane">
+          <h2>Details</h2>
+          <p class="status" id="detailStatus">Select an advisory.</p>
+          <div id="detailBox" class="detail-block">—</div>
+        </div>
+      </div>
+    </section>
+    <footer>OSV advisory index · osv-advisories.json</footer>
+  </main>
+
+  <script>
+    var lastRows = [];
+
+    function escapeHtml(s) {
+      return String(s || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function setStatus(msg, isErr) {
+      var el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = 'status' + (isErr ? ' err' : '');
+    }
+
+    function severityWord(score) {
+      var n = Number(score);
+      if (!isFinite(n) || n <= 0) return '';
+      if (n >= 9) return 'critical';
+      if (n >= 7) return 'important';
+      if (n >= 4) return 'moderate';
+      return 'low';
+    }
+
+    function severityHtml(row) {
+      var raw = String((row && row.severity) || '').trim().toLowerCase();
+      var named = raw === 'critical' || raw === 'important' || raw === 'moderate' || raw === 'low';
+      var score = Number(row && row.score);
+      var sev = named ? raw : severityWord(score);
+      if (!sev) return '—';
+      var label = sev.charAt(0).toUpperCase() + sev.slice(1);
+      var html = '<span class="badge-pair"><span class="badge badge-' + sev + '">' + escapeHtml(label) + '</span>';
+      if (isFinite(score) && score > 0) {
+        html += '<span class="badge badge-score">' + escapeHtml(score.toFixed(1)) + '</span>';
+      }
+      return html + '</span>';
+    }
+
+    function packageNames(row) {
+      return (row.packages || []).map(function (pkg) { return pkg.name; }).filter(Boolean);
+    }
+
+    function fixedVersions(row) {
+      var out = [];
+      (row.packages || []).forEach(function (pkg) {
+        (pkg.fixed || []).forEach(function (value) {
+          if (out.indexOf(value) === -1) out.push(value);
+        });
+      });
+      return out;
+    }
+
+    function showDetail(row) {
+      document.getElementById('detailStatus').textContent = row.id || 'Advisory';
+      var lines = [];
+      if (row.published) lines.push('Published ' + row.published);
+      (row.packages || []).forEach(function (pkg) {
+        if (!pkg.name) return;
+        var eco = pkg.ecosystem ? ' (' + pkg.ecosystem + ')' : '';
+        lines.push('', pkg.name + eco);
+        if (pkg.base) lines.push('  Base ' + pkg.base);
+        if ((pkg.fixed || []).length) lines.push('  Fixed ' + pkg.fixed.join(', '));
+      });
+      if ((row.cves || []).length) lines.push('', 'CVE  ' + row.cves.join(', '));
+      if ((row.aliases || []).length) lines.push('Also  ' + row.aliases.join(', '));
+      if (row.summary) lines.push('', row.summary);
+      if (row.details) lines.push('', row.details);
+      if ((row.refs || []).length) lines.push('', row.refs.join('\n'));
+      document.getElementById('detailBox').textContent = lines.join('\n').trim() || '—';
+      var pane = document.getElementById('detailPane');
+      if (!pane || !pane.getBoundingClientRect) return;
+      var rect = pane.getBoundingClientRect();
+      if (rect.bottom < 48 || rect.top > window.innerHeight - 48) {
+        pane.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    }
+
+    function renderRows(rows) {
+      var body = document.getElementById('advBody');
+      if (!rows.length) {
+        body.innerHTML = '<tr class="no-click"><td colspan="4" class="empty">No advisories</td></tr>';
+        document.getElementById('detailStatus').textContent = 'Select an advisory.';
+        document.getElementById('detailBox').textContent = '—';
+        return;
+      }
+      body.innerHTML = rows.map(function (row, i) {
+        var names = packageNames(row);
+        var fixed = fixedVersions(row);
+        return (
+          '<tr data-idx="' + i + '">' +
+          '<td class="mono">' + escapeHtml(row.id || '—') + '</td>' +
+          '<td>' + severityHtml(row) + '</td>' +
+          '<td class="mono">' + escapeHtml(names[0] || '—') +
+            (names.length > 1 ? '<div class="muted">+' + (names.length - 1) + ' more</div>' : '') +
+          '</td>' +
+          '<td class="mono">' + escapeHtml(fixed[0] || '—') + '</td>' +
+          '</tr>'
+        );
+      }).join('');
+      Array.prototype.forEach.call(body.querySelectorAll('tr[data-idx]'), function (tr) {
+        tr.addEventListener('click', function () {
+          Array.prototype.forEach.call(body.querySelectorAll('tr'), function (x) { x.classList.remove('is-selected'); });
+          tr.classList.add('is-selected');
+          showDetail(lastRows[Number(tr.getAttribute('data-idx'))]);
+        });
+      });
+      body.querySelector('tr[data-idx="0"]').click();
+    }
+
+    function lookup() {
+      var query = document.getElementById('query').value.trim();
+      var sev = document.getElementById('sevMin').value;
+      if (!query && sev === '') {
+        setStatus('Enter a CVE id, an RHLW id, a package, or a release.', true);
+        return;
+      }
+      setStatus('Looking up…');
+      document.getElementById('btnLookup').disabled = true;
+      google.script.run
+        .withSuccessHandler(function (res) {
+          document.getElementById('btnLookup').disabled = false;
+          if (!res || !res.ok) {
+            setStatus((res && res.error) || 'Lookup failed', true);
+            return;
+          }
+          lastRows = res.data || [];
+          var total = Number(res.total != null ? res.total : lastRows.length);
+          var msg = 'Found ' + total.toLocaleString() + ' advisor' + (total === 1 ? 'y' : 'ies');
+          if (total > lastRows.length) msg += ' · showing ' + lastRows.length;
+          if (res.updated_at) msg += ' · index ' + String(res.updated_at).slice(0, 10);
+          if (res.note) msg += ' · ' + res.note;
+          setStatus(msg, false);
+          renderRows(lastRows);
+        })
+        .withFailureHandler(function (err) {
+          document.getElementById('btnLookup').disabled = false;
+          setStatus(String(err), true);
+        })
+        .apiAdvisoryLookup({
+          query: query,
+          severity_min: sev
+        });
+    }
+
+    document.getElementById('btnLookup').addEventListener('click', lookup);
+    document.getElementById('query').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') lookup();
+    });
+  </script>
+</body>
+</html>

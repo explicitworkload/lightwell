@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Lightwell Recent Releases</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <?!= include('Styles'); ?>
+</head>
+<body
+  data-webapp-base="<?= webAppBase ?>"
+  data-webapp-key="<?= webAppKey ?>"
+  data-url-browser="<?= urlBrowser ?>">
+  <div class="glow glow-a" aria-hidden="true"></div>
+  <div class="glow glow-b" aria-hidden="true"></div>
+  <main>
+    <nav class="topnav" aria-label="Primary">
+      <a href="<?= urlDashboard ?>" target="_top">Dashboard</a>
+      <a href="<?= urlBrowser ?>" target="_top">Catalog Browser</a>
+      <a class="is-active" href="<?= urlRecent ?>" target="_top">Recent Releases</a>
+      <a href="<?= urlCve ?>" target="_top">CVE / RHLW Lookup</a>
+      <a href="<?= urlMatch ?>" target="_top">Dependency Match</a>
+    </nav>
+
+    <p class="eyebrow">Content-Sources · Newest First</p>
+    <h1>Lightwell Recent Releases</h1>
+    <p class="sub">Newest package publications across ecosystems, capped at the last 300.</p>
+
+    <section class="panel">
+      <div class="toolbar">
+        <label class="field">
+          Ecosystem
+          <select id="ecosystem">
+            <option value="" selected>All</option>
+            <option value="maven">Java</option>
+            <option value="python">Python</option>
+            <option value="npm">npm</option>
+          </select>
+        </label>
+        <label class="field">
+          Security Level
+          <select id="level">
+            <option value="">All</option>
+            <option value="validated">Validated</option>
+            <option value="remediated" selected>Remediated</option>
+          </select>
+        </label>
+        <label class="field">
+          Page size
+          <select id="pageSize">
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+          </select>
+        </label>
+        <button type="button" class="btn btn-primary" id="btnRefresh">Refresh</button>
+      </div>
+      <p class="status" id="status">Loading…</p>
+      <div class="table-wrap">
+        <table class="table-recent">
+          <thead>
+            <tr>
+              <th>Package</th>
+              <th>Ecosystem</th>
+              <th>Repo</th>
+              <th>Latest Release</th>
+              <th>CVE</th>
+              <th>Last Updated</th>
+              <th>Registry</th>
+            </tr>
+          </thead>
+          <tbody id="body">
+            <tr class="no-click"><td colspan="7" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button type="button" class="btn btn-ghost" id="prevPage" disabled>Previous</button>
+        <span id="pageLabel"></span>
+        <button type="button" class="btn btn-ghost" id="nextPage" disabled>Next</button>
+      </div>
+    </section>
+    <footer>Catalog API · /lightwell/packages?sort_by=last_publication:desc</footer>
+  </main>
+
+  <script>
+    const MAX_ITEMS = 300;
+    const WEBAPP_BASE = document.body.getAttribute('data-webapp-base') || '';
+    const WEBAPP_KEY = document.body.getAttribute('data-webapp-key') || '';
+    const URL_BROWSER = document.body.getAttribute('data-url-browser') || '';
+    let offset = 0;
+    let windowTotal = 0;
+    let pageSize = 50;
+
+    function webAppBaseUrl() {
+      var base = WEBAPP_BASE;
+      if (base) return base;
+      var nav = URL_BROWSER;
+      var i = nav.indexOf('?');
+      return i >= 0 ? nav.slice(0, i) : nav;
+    }
+
+    function registryProxyUrl(directUrl) {
+      var base = webAppBaseUrl();
+      var raw = String(directUrl || '').trim();
+      var origin = 'https://packages.redhat.com/';
+      var path = raw.indexOf(origin) === 0 ? raw.slice(origin.length) : '';
+      if (!base || !path || path.indexOf('lightwell/') !== 0) {
+        return base || '#';
+      }
+      var q = 'page=registry&path=' + encodeURIComponent(path);
+      if (WEBAPP_KEY) q += '&key=' + encodeURIComponent(WEBAPP_KEY);
+      return base + '?' + q;
+    }
+
+    function escapeHtml(s) {
+      return String(s || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function setStatus(msg, isErr) {
+      const el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = 'status' + (isErr ? ' err' : '');
+    }
+
+    function levelBadge(repo) {
+      if (!repo) return '';
+      if (repo.indexOf('remediated') !== -1) return '<span class="badge badge-remediated">Remediated</span>';
+      if (repo.indexOf('validated') !== -1) return '<span class="badge badge-validated">Validated</span>';
+      return '<span class="muted">' + escapeHtml(repo) + '</span>';
+    }
+
+    function ecosystemLabel(eco) {
+      var e = String(eco || '').toLowerCase();
+      if (e === 'maven') return 'java';
+      return e || '—';
+    }
+
+    function fmtWhen(iso) {
+      if (!iso) return '—';
+      var t = Date.parse(iso);
+      if (!isFinite(t)) return escapeHtml(iso);
+      var ms = Date.now() - t;
+      if (ms < 0) ms = 0;
+      var mins = Math.floor(ms / 60000);
+      var hours = Math.floor(ms / 3600000);
+      var days = Math.floor(ms / 86400000);
+      if (mins < 1) return 'Just now';
+      if (mins < 60) return mins + ' minute' + (mins === 1 ? '' : 's') + ' ago';
+      if (hours < 24) return hours + ' hour' + (hours === 1 ? '' : 's') + ' ago';
+      if (days <= 30) return 'Last ' + days + ' day' + (days === 1 ? '' : 's');
+      return escapeHtml(new Intl.DateTimeFormat(undefined, {
+        month: 'short', day: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: false
+      }).format(new Date(t)));
+    }
+
+    /** Newest release qualifier from latest_releases[0]. */
+    function fmtLatestRelease(pkg) {
+      pkg = pkg || {};
+      var releases = pkg.latest_releases || [];
+      if (!releases.length) {
+        var v0 = (pkg.versions && pkg.versions[0]) || '';
+        return escapeHtml(v0 || '—');
+      }
+      var r = releases[0] || {};
+      var ver = String(r.version || '');
+      var rel = String(r.release || '');
+      var eco = String(pkg.ecosystem || '').toLowerCase();
+      if (ver && rel) {
+        if (eco === 'maven') return escapeHtml(ver + '.' + rel);
+        return escapeHtml(ver + '+' + rel);
+      }
+      return escapeHtml(ver || rel || '—');
+    }
+
+    function severityWord(score) {
+      var n = Number(score);
+      if (!isFinite(n) || n <= 0) return '';
+      if (n >= 9) return 'critical';
+      if (n >= 7) return 'important';
+      if (n >= 4) return 'moderate';
+      return 'low';
+    }
+
+    function severityCell(r) {
+      var raw = String((r && r.severity) || '').trim().toLowerCase();
+      var named = raw === 'critical' || raw === 'important' || raw === 'moderate' || raw === 'low';
+      var nums = [];
+      [r && r.severity_score, named ? '' : raw].forEach(function (value) {
+        String(value == null ? '' : value).replace(/\d+(?:\.\d+)?/g, function (token) {
+          var n = Number(token);
+          if (isFinite(n)) nums.push(n);
+        });
+      });
+      var score = nums.length ? Math.max.apply(null, nums) : NaN;
+      var sev = named ? raw : severityWord(score);
+      if (!sev) return '—';
+      var label = sev.charAt(0).toUpperCase() + sev.slice(1);
+      var count = Number(r && r.cve_count) || 0;
+      var title = count > 1 ? (count + ' advisories, highest shown') : 'Highest advisory for this release';
+      var html = '<span class="badge-pair">' +
+        '<span class="badge badge-' + sev + '" title="' + escapeHtml(title) + '">' + escapeHtml(label) + '</span>';
+      if (isFinite(score) && score > 0) {
+        html += '<span class="badge badge-score" title="CVSS">' + escapeHtml(score.toFixed(1)) + '</span>';
+      }
+      return html + '</span>';
+    }
+
+    function renderRows(rows) {
+      const body = document.getElementById('body');
+      if (!rows.length) {
+        body.innerHTML = '<tr class="no-click"><td colspan="7" class="empty">No packages found</td></tr>';
+        return;
+      }
+      body.innerHTML = rows.map(function (r) {
+        const label = r.group ? (r.group + ':' + r.name) : r.name;
+        return (
+          '<tr class="no-click">' +
+          '<td><strong class="cell-clip">' + escapeHtml(label) + '</strong></td>' +
+          '<td class="mono">' + escapeHtml(ecosystemLabel(r.ecosystem)) + '</td>' +
+          '<td>' + levelBadge(r.repository) +
+          '<div class="muted mono cell-ellipsis">' + escapeHtml(r.repository) + '</div></td>' +
+          '<td class="mono col-release">' + fmtLatestRelease(r) + '</td>' +
+          '<td>' + severityCell(r) + '</td>' +
+          '<td class="mono">' + fmtWhen(r.last_publication) + '</td>' +
+          '<td>' + (r.registry_url
+            ? '<a href="' + escapeHtml(registryProxyUrl(r.registry_url)) + '" target="_top" rel="noopener">Open</a>'
+            : '—') + '</td>' +
+          '</tr>'
+        );
+      }).join('');
+    }
+
+    function updatePager(rowCount) {
+      document.getElementById('prevPage').disabled = offset <= 0;
+      var atCap = offset + pageSize >= MAX_ITEMS;
+      var shortPage = rowCount < pageSize;
+      document.getElementById('nextPage').disabled = atCap || shortPage || offset + rowCount >= windowTotal;
+      const start = windowTotal || rowCount ? offset + (rowCount ? 1 : 0) : 0;
+      const end = offset + rowCount;
+      document.getElementById('pageLabel').textContent = rowCount
+        ? (start + '–' + end + ' of ' + windowTotal.toLocaleString() + ' (capped at ' + MAX_ITEMS + ')')
+        : '';
+    }
+
+    function loadRecent() {
+      pageSize = Number(document.getElementById('pageSize').value) || 50;
+      const ecosystem = document.getElementById('ecosystem').value;
+      const level = document.getElementById('level').value;
+      setStatus('Loading…');
+      document.getElementById('btnRefresh').disabled = true;
+      google.script.run
+        .withSuccessHandler(function (res) {
+          document.getElementById('btnRefresh').disabled = false;
+          if (!res || !res.ok) {
+            setStatus((res && res.error) || 'Load failed', true);
+            return;
+          }
+          const rows = res.data || [];
+          windowTotal = Number((res.meta && res.meta.count) || rows.length);
+          const apiCount = Number((res.meta && res.meta.api_count) || windowTotal);
+          setStatus(
+            'Showing newest publications' +
+            (ecosystem ? ' · ' + ecosystemLabel(ecosystem) : ' · all ecosystems') +
+            (apiCount > MAX_ITEMS ? ' · catalog has ' + apiCount.toLocaleString() + ' matching packages' : '')
+          );
+          renderRows(rows);
+          updatePager(rows.length);
+        })
+        .withFailureHandler(function (err) {
+          document.getElementById('btnRefresh').disabled = false;
+          setStatus(String(err), true);
+        })
+        .apiCatalogRecent({
+          ecosystem: ecosystem || undefined,
+          security_level: level || undefined,
+          limit: pageSize,
+          offset: offset
+        });
+    }
+
+    document.getElementById('btnRefresh').addEventListener('click', function () {
+      offset = 0;
+      loadRecent();
+    });
+    document.getElementById('ecosystem').addEventListener('change', function () {
+      offset = 0;
+      loadRecent();
+    });
+    document.getElementById('level').addEventListener('change', function () {
+      offset = 0;
+      loadRecent();
+    });
+    document.getElementById('pageSize').addEventListener('change', function () {
+      offset = 0;
+      loadRecent();
+    });
+    document.getElementById('prevPage').addEventListener('click', function () {
+      offset = Math.max(0, offset - pageSize);
+      loadRecent();
+    });
+    document.getElementById('nextPage').addEventListener('click', function () {
+      offset = Math.min(MAX_ITEMS - pageSize, offset + pageSize);
+      loadRecent();
+    });
+
+    loadRecent();
+  </script>
+</body>
+</html>

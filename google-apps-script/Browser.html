@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Lightwell Catalog Browser</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <?!= include('Styles'); ?>
+</head>
+<body
+  data-webapp-base="<?= webAppBase ?>"
+  data-webapp-key="<?= webAppKey ?>"
+  data-url-browser="<?= urlBrowser ?>">
+  <div class="glow glow-a" aria-hidden="true"></div>
+  <div class="glow glow-b" aria-hidden="true"></div>
+  <main>
+    <nav class="topnav" aria-label="Primary">
+      <a href="<?= urlDashboard ?>" target="_top">Dashboard</a>
+      <a class="is-active" href="<?= urlBrowser ?>" target="_top">Catalog Browser</a>
+      <a href="<?= urlRecent ?>" target="_top">Recent Releases</a>
+      <a href="<?= urlCve ?>" target="_top">CVE / RHLW Lookup</a>
+      <a href="<?= urlMatch ?>" target="_top">Dependency Match</a>
+    </nav>
+
+    <p class="eyebrow">Content-Sources · Search</p>
+    <h1>Lightwell Catalog Browser</h1>
+    <p class="sub">Search packages via the catalog API, then drill into versions. Separate names with commas.</p>
+
+    <section class="panel">
+      <div class="toolbar">
+        <label class="field">
+          Ecosystem
+          <select id="ecosystem">
+            <option value="" selected>All</option>
+            <option value="maven">Java</option>
+            <option value="python">Python</option>
+            <option value="npm">npm</option>
+          </select>
+        </label>
+        <label class="field">
+          Security Level
+          <select id="level">
+            <option value="">All</option>
+            <option value="validated">Validated</option>
+            <option value="remediated" selected>Remediated</option>
+          </select>
+        </label>
+        <label class="field grow">
+          Search
+          <input id="search" type="search" placeholder="e.g. jackson, requests, lodash" />
+        </label>
+        <button type="button" class="btn btn-primary" id="btnSearch">Search</button>
+      </div>
+      <p class="status" id="status">Loading packages…</p>
+      <div class="layout">
+        <div class="pane pane-packages">
+          <h2>Packages</h2>
+          <div class="pkg-list" id="pkgBody">
+            <div class="empty">Loading…</div>
+          </div>
+          <div class="pager">
+            <button type="button" class="btn btn-ghost" id="prevPage" disabled>Previous</button>
+            <span id="pageLabel"></span>
+            <button type="button" class="btn btn-ghost" id="nextPage" disabled>Next</button>
+          </div>
+        </div>
+        <div class="pane pane-versions" id="versionsPane">
+          <h2>Versions</h2>
+          <p class="status" id="verStatus">Select a package.</p>
+          <div class="table-wrap">
+            <table class="table-versions">
+              <thead>
+                <tr>
+                  <th>Version</th>
+                  <th>Release</th>
+                  <th>CVE</th>
+                  <th>Last Updated</th>
+                  <th>Registry</th>
+                </tr>
+              </thead>
+              <tbody id="verBody">
+                <tr class="no-click"><td colspan="5" class="empty">—</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+    <footer>Catalog API · /lightwell/packages + /lightwell/package_versions</footer>
+  </main>
+
+  <script>
+    const PAGE_SIZE = 25;
+    const WEBAPP_BASE = document.body.getAttribute('data-webapp-base') || '';
+    const WEBAPP_KEY = document.body.getAttribute('data-webapp-key') || '';
+    const URL_BROWSER = document.body.getAttribute('data-url-browser') || '';
+    let offset = 0;
+    let total = 0;
+
+    /**
+     * Absolute /exec (or /dev) base. Relative ?page= + target=_top often lands on
+     * Drive ("Sorry, unable to open the file at present").
+     */
+    function webAppBaseUrl() {
+      var base = WEBAPP_BASE;
+      if (base) return base;
+      var nav = URL_BROWSER;
+      var i = nav.indexOf('?');
+      return i >= 0 ? nav.slice(0, i) : nav;
+    }
+
+    /**
+     * Proxy via path=lightwell/… — avoid embedding https:// in the query string
+     * (Google's web-app frontend mangles nested URLs into a Drive error page).
+     */
+    function registryProxyUrl(directUrl) {
+      var base = webAppBaseUrl();
+      var raw = String(directUrl || '').trim();
+      var origin = 'https://packages.redhat.com/';
+      var path = raw.indexOf(origin) === 0 ? raw.slice(origin.length) : '';
+      if (!base || !path || path.indexOf('lightwell/') !== 0) {
+        return base || '#';
+      }
+      var q = 'page=registry&path=' + encodeURIComponent(path);
+      if (WEBAPP_KEY) q += '&key=' + encodeURIComponent(WEBAPP_KEY);
+      return base + '?' + q;
+    }
+
+    function setStatus(msg, isErr) {
+      const el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = 'status' + (isErr ? ' err' : '');
+    }
+
+    function levelBadge(repo) {
+      if (!repo) return '';
+      if (repo.indexOf('remediated') !== -1) return '<span class="badge badge-remediated">Remediated</span>';
+      if (repo.indexOf('validated') !== -1) return '<span class="badge badge-validated">Validated</span>';
+      return '<span class="muted">' + escapeHtml(repo) + '</span>';
+    }
+
+    function escapeHtml(s) {
+      return String(s || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function fmtWhen(iso) {
+      if (!iso) return '—';
+      var t = Date.parse(iso);
+      if (!isFinite(t)) return escapeHtml(iso);
+      var ms = Date.now() - t;
+      if (ms < 0) ms = 0;
+      var mins = Math.floor(ms / 60000);
+      var hours = Math.floor(ms / 3600000);
+      var days = Math.floor(ms / 86400000);
+      if (mins < 1) return 'Just now';
+      if (mins < 60) return mins + ' minute' + (mins === 1 ? '' : 's') + ' ago';
+      if (hours < 24) return hours + ' hour' + (hours === 1 ? '' : 's') + ' ago';
+      if (days <= 30) return 'Last ' + days + ' day' + (days === 1 ? '' : 's');
+      return escapeHtml(new Intl.DateTimeFormat(undefined, {
+        month: 'short', day: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: false
+      }).format(new Date(t)));
+    }
+
+    /** Display label for API ecosystem codes (maven → Java). */
+    function ecosystemLabel(eco) {
+      var e = String(eco || '').toLowerCase();
+      if (e === 'maven' || e === 'java') return 'Java';
+      if (e === 'python') return 'Python';
+      if (e === 'npm') return 'npm';
+      return e || '—';
+    }
+
+    /**
+     * Full Red Hat release qualifier from purl (@…), e.g. 3.5.0.rhlw-00003
+     * or 1.45.26+rhlw.1 — not the short release suffix alone.
+     */
+    function fmtRelease(r) {
+      r = r || {};
+      var purl = String(r.purl || '');
+      var at = purl.lastIndexOf('@');
+      if (at !== -1) {
+        var q = purl.slice(at + 1).split('?')[0].split('#')[0];
+        if (q) return q;
+      }
+      var ver = String(r.version || '');
+      var rel = String(r.release || '');
+      if (ver && rel) {
+        var eco = String(r.ecosystem || '').toLowerCase();
+        if (eco === 'maven') return ver + '.' + rel;
+        return ver + '+' + rel;
+      }
+      return rel || '—';
+    }
+
+    /** Escape, then allow a wrap after . : / + _ - so long coordinates stay readable. */
+    function withBreaks(value) {
+      return escapeHtml(value).replace(/([.:/+_-])/g, '$1<wbr>');
+    }
+
+    /** Newest version first (4.2.2 > 3.6.9 > 3.5.0); same version → higher release. */
+    function cmpVersionDesc(a, b) {
+      var pa = String(a || '').replace(/^v/i, '').split(/[^0-9A-Za-z]+/);
+      var pb = String(b || '').replace(/^v/i, '').split(/[^0-9A-Za-z]+/);
+      var n = Math.max(pa.length, pb.length);
+      for (var i = 0; i < n; i++) {
+        var sa = pa[i] || '0';
+        var sb = pb[i] || '0';
+        var na = parseInt(sa, 10);
+        var nb = parseInt(sb, 10);
+        var aNum = sa !== '' && String(na) === sa;
+        var bNum = sb !== '' && String(nb) === sb;
+        if (aNum && bNum) {
+          if (na !== nb) return nb - na;
+          continue;
+        }
+        if (aNum !== bNum) return aNum ? -1 : 1;
+        var c = sb.toLowerCase().localeCompare(sa.toLowerCase());
+        if (c) return c;
+      }
+      return 0;
+    }
+
+    function sortVersionsNewestFirst(rows) {
+      return (rows || []).slice().sort(function (a, b) {
+        var v = cmpVersionDesc(a.version, b.version);
+        if (v) return v;
+        var r = cmpVersionDesc(a.release, b.release);
+        if (r) return r;
+        return (Date.parse(b.created_at) || 0) - (Date.parse(a.created_at) || 0);
+      });
+    }
+
+    function versionChips(versions) {
+      var list = versions || [];
+      if (!list.length) return '';
+      var shown = list.slice(0, 3).map(function (v) {
+        return '<span class="ver-chip">' + withBreaks(v) + '</span>';
+      }).join('');
+      if (list.length > 3) {
+        shown += '<span class="ver-chip ver-chip-more">+' + (list.length - 3) + '</span>';
+      }
+      return '<span class="pkg-vers">' + shown + '</span>';
+    }
+
+    function renderPackages(rows) {
+      const body = document.getElementById('pkgBody');
+      if (!rows.length) {
+        body.innerHTML = '<div class="empty">No packages found</div>';
+        return;
+      }
+      body.innerHTML = rows.map(function (r, i) {
+        var artifact = r.name || '';
+        var group = r.group || '';
+        var full = group ? (group + ':' + artifact) : artifact;
+        var nVer = (r.versions && r.versions.length) || 0;
+        return (
+          '<button type="button" class="pkg-card" data-idx="' + i + '" title="' + escapeHtml(full) + '">' +
+          '<span class="pkg-name">' + withBreaks(artifact || full) + '</span>' +
+          (group ? '<span class="pkg-group">' + withBreaks(group) + '</span>' : '') +
+          '<span class="pkg-meta">' +
+            levelBadge(r.repository) +
+            '<span>' + escapeHtml(ecosystemLabel(r.ecosystem)) + '</span>' +
+            '<span>' + fmtWhen(r.last_publication) + '</span>' +
+            '<span>' + nVer + ' version' + (nVer === 1 ? '' : 's') + '</span>' +
+          '</span>' +
+          (r.repository ? '<span class="pkg-repo">' + withBreaks(r.repository) + '</span>' : '') +
+          versionChips(r.versions) +
+          '</button>'
+        );
+      }).join('');
+      Array.prototype.forEach.call(body.querySelectorAll('.pkg-card'), function (card) {
+        card.addEventListener('click', function () {
+          Array.prototype.forEach.call(body.querySelectorAll('.pkg-card'), function (x) { x.classList.remove('is-selected'); });
+          card.classList.add('is-selected');
+          loadVersions(rows[Number(card.getAttribute('data-idx'))]);
+          revealVersions();
+        });
+      });
+    }
+
+    function severityWord(score) {
+      var n = Number(score);
+      if (!isFinite(n) || n <= 0) return '';
+      if (n >= 9) return 'critical';
+      if (n >= 7) return 'important';
+      if (n >= 4) return 'moderate';
+      return 'low';
+    }
+
+    function severityCell(r) {
+      var raw = String((r && r.severity) || '').trim().toLowerCase();
+      var named = raw === 'critical' || raw === 'important' || raw === 'moderate' || raw === 'low';
+      var nums = [];
+      [r && r.severity_score, named ? '' : raw].forEach(function (value) {
+        String(value == null ? '' : value).replace(/\d+(?:\.\d+)?/g, function (token) {
+          var n = Number(token);
+          if (isFinite(n)) nums.push(n);
+        });
+      });
+      var score = nums.length ? Math.max.apply(null, nums) : NaN;
+      var sev = named ? raw : severityWord(score);
+      if (!sev) return '—';
+      var label = sev.charAt(0).toUpperCase() + sev.slice(1);
+      var count = Number(r && r.cve_count) || 0;
+      var title = count > 1 ? (count + ' advisories, highest shown') : 'Highest advisory for this version';
+      var html = '<span class="badge-pair">' +
+        '<span class="badge badge-' + sev + '" title="' + escapeHtml(title) + '">' + escapeHtml(label) + '</span>';
+      if (isFinite(score) && score > 0) {
+        html += '<span class="badge badge-score" title="CVSS">' + escapeHtml(score.toFixed(1)) + '</span>';
+      }
+      return html + '</span>';
+    }
+
+    function renderVersions(rows) {
+      const body = document.getElementById('verBody');
+      rows = sortVersionsNewestFirst(rows || []);
+      if (!rows.length) {
+        body.innerHTML = '<tr class="no-click"><td colspan="5" class="empty">No versions returned</td></tr>';
+        return;
+      }
+      body.innerHTML = rows.map(function (r) {
+        return (
+          '<tr class="no-click">' +
+          '<td class="mono">' + escapeHtml(r.version) + '</td>' +
+          '<td class="mono col-release">' + withBreaks(fmtRelease(r)) + '</td>' +
+          '<td>' + severityCell(r) + '</td>' +
+          '<td class="mono">' + fmtWhen(r.created_at) + '</td>' +
+          '<td><a href="' + escapeHtml(registryProxyUrl(r.registry_url)) + '" target="_top" rel="noopener">Open</a></td>' +
+          '</tr>'
+        );
+      }).join('');
+    }
+
+    function updatePager() {
+      document.getElementById('prevPage').disabled = offset <= 0;
+      document.getElementById('nextPage').disabled = offset + PAGE_SIZE >= total;
+      const start = total ? offset + 1 : 0;
+      const end = Math.min(offset + PAGE_SIZE, total);
+      document.getElementById('pageLabel').textContent = total
+        ? (start + '–' + end + ' of ' + total.toLocaleString())
+        : '';
+    }
+
+    function searchPackages() {
+      const ecosystem = document.getElementById('ecosystem').value;
+      const level = document.getElementById('level').value;
+      const search = document.getElementById('search').value.trim();
+      setStatus('Searching…');
+      document.getElementById('btnSearch').disabled = true;
+      google.script.run
+        .withSuccessHandler(function (res) {
+          document.getElementById('btnSearch').disabled = false;
+          if (!res || !res.ok) {
+            setStatus((res && res.error) || 'Search failed', true);
+            return;
+          }
+          total = Number((res.meta && res.meta.count) || 0);
+          var statusMsg = 'Found ' + total.toLocaleString() + ' package' + (total === 1 ? '' : 's');
+          if (res.meta && res.meta.partial) {
+            statusMsg += ' · each name is capped at the closest matches';
+          }
+          setStatus(statusMsg);
+          renderPackages(res.data || []);
+          updatePager();
+          var first = document.querySelector('#pkgBody .pkg-card');
+          if (first) {
+            first.click();
+          } else {
+            document.getElementById('verBody').innerHTML = '<tr class="no-click"><td colspan="5" class="empty">Select a package</td></tr>';
+            document.getElementById('verStatus').textContent = 'Select a package.';
+            document.getElementById('verStatus').className = 'status';
+          }
+        })
+        .withFailureHandler(function (err) {
+          document.getElementById('btnSearch').disabled = false;
+          setStatus(String(err), true);
+        })
+        .apiCatalogSearch({
+          ecosystem: ecosystem,
+          security_level: level,
+          search: search,
+          limit: PAGE_SIZE,
+          offset: offset
+        });
+    }
+
+    function revealVersions() {
+      var pane = document.getElementById('versionsPane');
+      if (!pane || !pane.getBoundingClientRect) return;
+      var rect = pane.getBoundingClientRect();
+      var hidden = rect.bottom < 48 || rect.top > window.innerHeight - 48;
+      if (hidden) pane.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    function loadVersions(pkg) {
+      document.getElementById('verStatus').className = 'status';
+      document.getElementById('verStatus').textContent = 'Loading versions for ' + (pkg.group ? pkg.group + ':' : '') + pkg.name + '…';
+      const level = document.getElementById('level').value;
+      google.script.run
+        .withSuccessHandler(function (res) {
+          if (!res || !res.ok) {
+            document.getElementById('verStatus').textContent = (res && res.error) || 'Failed';
+            document.getElementById('verStatus').className = 'status err';
+            return;
+          }
+          const n = Number((res.meta && res.meta.count) || (res.data || []).length);
+          var osvNote = '';
+          if (res.osv === 'missing') {
+            osvNote = ' · CVE index not built yet — run syncOsvIndex in Apps Script';
+          } else if (res.osv === 'partial') {
+            osvNote = ' · CVE index still building';
+          }
+          document.getElementById('verStatus').className = 'status';
+          document.getElementById('verStatus').innerHTML =
+            n.toLocaleString() + ' version' + (n === 1 ? '' : 's') +
+            ' · <a href="' + escapeHtml(registryProxyUrl(pkg.registry_url)) + '" target="_top" rel="noopener">Browse registry folder</a>' +
+            escapeHtml(osvNote);
+          renderVersions(res.data || []);
+          revealVersions();
+        })
+        .withFailureHandler(function (err) {
+          document.getElementById('verStatus').textContent = String(err);
+          document.getElementById('verStatus').className = 'status err';
+        })
+        .apiCatalogVersions({
+          ecosystem: pkg.ecosystem,
+          security_level: level || undefined,
+          name: pkg.name,
+          repository: pkg.repository,
+          limit: 50,
+          offset: 0
+        });
+    }
+
+    document.getElementById('btnSearch').addEventListener('click', function () {
+      offset = 0;
+      searchPackages();
+    });
+    document.getElementById('search').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        offset = 0;
+        searchPackages();
+      }
+    });
+    document.getElementById('prevPage').addEventListener('click', function () {
+      offset = Math.max(0, offset - PAGE_SIZE);
+      searchPackages();
+    });
+    document.getElementById('nextPage').addEventListener('click', function () {
+      offset += PAGE_SIZE;
+      searchPackages();
+    });
+    searchPackages();
+  </script>
+</body>
+</html>
