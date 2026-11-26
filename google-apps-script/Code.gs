@@ -704,13 +704,19 @@ function buildCatalogPage_(allRows, options) {
       );
     })
     .join("");
+  var defaultEco = "maven";
   var ecoButtons =
-    "<button type='button' class='seg-btn is-active' data-eco='' aria-pressed='true'>All</button>" +
+    "<button type='button' class='seg-btn' data-eco='' aria-pressed='false'>All</button>" +
     ECOSYSTEMS.map(function (eco) {
+      var on = eco === defaultEco;
       return (
-        "<button type='button' class='seg-btn' data-eco='" +
+        "<button type='button' class='seg-btn" +
+        (on ? " is-active" : "") +
+        "' data-eco='" +
         esc_(eco) +
-        "' aria-pressed='false'>" +
+        "' aria-pressed='" +
+        (on ? "true" : "false") +
+        "'>" +
         esc_(ecosystemLabel_(eco)) +
         "</button>"
       );
@@ -932,7 +938,7 @@ function dashboardClientScript_() {
     "    b.setAttribute('aria-pressed',on?'true':'false');" +
     "  });" +
     "}" +
-    "var chartEco='';" +
+    "var chartEco='maven';" +
     "function syncEco(){" +
     "  document.querySelectorAll('#trendEco .seg-btn').forEach(function(b){" +
     "    var on=(b.getAttribute('data-eco')||'')===chartEco;" +
