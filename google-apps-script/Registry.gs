@@ -3,7 +3,7 @@
  *   LW_USER  — registry username (e.g. 1234567|my-sa)
  *   LW_TOKEN — registry token (Basic Auth password)
  *
- * Browser never sees credentials. Web app access should stay "Only myself" / org + WEBAPP_KEY.
+ * Browser never sees credentials. The approved-email list gates the proxy.
  */
 
 var REGISTRY_ORIGIN = "https://packages.redhat.com";
@@ -12,6 +12,7 @@ var REGISTRY_PREFIX = "https://packages.redhat.com/lightwell/";
 var REGISTRY_PULP_PREFIX = "https://packages.redhat.com/api/pulp-content/lightwell/";
 
 function getRegistryBasicAuthHeader_() {
+  requireApproved_();
   var props = PropertiesService.getScriptProperties();
   var user = (props.getProperty("LW_USER") || "").trim();
   var token = (props.getProperty("LW_TOKEN") || "").trim();
@@ -235,6 +236,7 @@ function serveRegistryBinaryPage_(response, targetUrl, linkKey) {
 }
 
 function serveRegistryProxy_(params, linkKey) {
+  requireApproved_();
   var target = resolveRegistryTarget_(params);
   if (!target) {
     return htmlOutput_(

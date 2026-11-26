@@ -20,6 +20,9 @@
       <a href="<?= urlRecent ?>" target="_top">Recent Releases</a>
       <a class="is-active" href="<?= urlCve ?>" target="_top">CVE / RHLW Lookup</a>
       <a href="<?= urlMatch ?>" target="_top">Dependency Match</a>
+      <? if (showAccess) { ?>
+      <a href="<?= urlAccess ?>" target="_top">Access</a>
+      <? } ?>
     </nav>
 
     <p class="eyebrow">OSV · Advisories</p>

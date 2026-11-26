@@ -269,6 +269,7 @@ function catalogSearchParams_(opts, term, limit, offset) {
 function apiCatalogSearch(opts) {
   opts = opts || {};
   try {
+    requireApproved_();
     var props = PropertiesService.getScriptProperties();
     var token = getAccessToken_(props);
     var terms = splitSearchTerms_(opts.search);
@@ -334,6 +335,7 @@ function apiCatalogSearchMany_(token, opts, terms, pageLimit, pageOffset) {
 function apiCatalogRecent(opts) {
   opts = opts || {};
   try {
+    requireApproved_();
     var props = PropertiesService.getScriptProperties();
     var token = getAccessToken_(props);
     var maxTotal = 300;
@@ -475,6 +477,7 @@ function attachVersionSeverity_(rows, advisories) {
 function apiCatalogVersions(opts) {
   opts = opts || {};
   try {
+    requireApproved_();
     var props = PropertiesService.getScriptProperties();
     var token = getAccessToken_(props);
     var params = {
@@ -527,6 +530,7 @@ function apiCatalogVersions(opts) {
 function apiCatalogAdvisories(opts) {
   opts = opts || {};
   try {
+    requireApproved_();
     var props = PropertiesService.getScriptProperties();
     var token = getAccessToken_(props);
     var params = {
@@ -573,6 +577,8 @@ function apiCatalogAdvisories(opts) {
  * Until the catalog exists, a CVE id falls back to the content-sources advisories API.
  */
 function apiAdvisoryLookup(opts) {
+  var denied = clientAccess_();
+  if (denied) return denied;
   opts = opts || {};
   var query = String(opts.query || opts.cve_id || "").trim();
   var minScore = opts.severity_min === "" || opts.severity_min == null ? "" : opts.severity_min;
@@ -641,6 +647,7 @@ function catalogAdvisoryRow_(row) {
 function apiDependencyMatch(opts) {
   opts = opts || {};
   try {
+    requireApproved_();
     var names = opts.names || [];
     if (!Array.isArray(names)) {
       names = String(names || "")

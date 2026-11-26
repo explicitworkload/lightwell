@@ -495,6 +495,21 @@
     max-height: 18rem;
     overflow: auto;
   }
+  .table-access { table-layout: auto; }
+  .table-access td:last-child,
+  .table-access th:last-child { width: 1%; text-align: right; white-space: nowrap; }
+  .table-access td:first-child { overflow-wrap: anywhere; }
+  .owner-tag {
+    display: inline-block;
+    border-radius: 999px;
+    padding: 0.15rem 0.55rem;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #bbf7d0;
+    background: rgba(74, 222, 128, 0.16);
+  }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
   footer {

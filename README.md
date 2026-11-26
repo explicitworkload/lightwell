@@ -4,6 +4,11 @@ Interactive helper to browse registry directory listings / index APIs and downlo
 
 > **Disclaimer:** This script is **not an officially supported Red Hat product or tool**. It is an unofficial helper that lets users interactively crawl Lightwell registry directories (and related index/Integrity endpoints) and download the packages they need. For supported day-to-day workflows, configure your build tools or on-prem repository managers (Artifactory / Nexus) per [Red Hat Lightwell Network documentation](https://docs.redhat.com/en/documentation/lightwell_network/current).
 
+
+![Alt text](static/main.png).
+![Alt text](static/interactivedownloader.png)
+
+
 ## Table of contents
 
 - [Architecture (what talks to what)](#architecture-what-talks-to-what)

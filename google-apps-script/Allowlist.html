@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Lightwell Access</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <div class="glow glow-a" aria-hidden="true"></div>
+  <div class="glow glow-b" aria-hidden="true"></div>
+  <main>
+    <nav class="topnav" aria-label="Primary">
+      <a href="<?= urlDashboard ?>" target="_top">Dashboard</a>
+      <a href="<?= urlBrowser ?>" target="_top">Catalog Browser</a>
+      <a href="<?= urlRecent ?>" target="_top">Recent Releases</a>
+      <a href="<?= urlCve ?>" target="_top">CVE / RHLW Lookup</a>
+      <a href="<?= urlMatch ?>" target="_top">Dependency Match</a>
+      <? if (showAccess) { ?>
+      <a class="is-active" href="<?= urlAccess ?>" target="_top">Access</a>
+      <? } ?>
+    </nav>
+
+    <p class="eyebrow">Owner · Approved Accounts</p>
+    <h1>Access</h1>
+    <p class="sub">Only these Google accounts can open the app. The deployment stays “Execute as: Me”. Set “Who has access” to anyone in Red Hat, then this list decides who gets in.</p>
+
+    <section class="panel">
+      <p class="status" id="accessStatus">Loading the approved list…</p>
+      <form class="toolbar" id="accessForm">
+        <label class="field grow">
+          Email
+          <input id="accessEmail" type="email" autocomplete="off" placeholder="name@redhat.com" required />
+        </label>
+        <button type="submit" class="btn btn-primary" id="accessAdd">Add</button>
+      </form>
+      <div class="table-wrap">
+        <table class="table-access">
+          <thead>
+            <tr><th>Email</th><th></th></tr>
+          </thead>
+          <tbody id="accessBody">
+            <tr><td colspan="2">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    function esc(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+    var statusEl = document.getElementById("accessStatus");
+    var bodyEl = document.getElementById("accessBody");
+    var formEl = document.getElementById("accessForm");
+    var inputEl = document.getElementById("accessEmail");
+    var addBtn = document.getElementById("accessAdd");
+
+    function setStatus(msg, isErr) {
+      statusEl.textContent = msg;
+      statusEl.classList.toggle("err", !!isErr);
+    }
+
+    function render(res) {
+      addBtn.disabled = false;
+      if (!res || !res.ok) {
+        setStatus((res && res.error) || "Could not load the list.", true);
+        return;
+      }
+      var users = res.users || [];
+      setStatus(
+        users.length === 1
+          ? "Signed in as " + (res.email || "the owner") + ". You are the only approved account."
+          : "Signed in as " + (res.email || "the owner") + ". " + users.length + " approved accounts."
+      );
+      if (!users.length) {
+        bodyEl.innerHTML = '<tr><td colspan="2">No approved accounts yet.</td></tr>';
+        return;
+      }
+      bodyEl.innerHTML = users.map(function (row) {
+        var email = esc(row.email);
+        var action = row.owner
+          ? '<span class="owner-tag">Owner</span>'
+          : '<button type="button" class="btn btn-ghost" data-email="' + email + '">Remove</button>';
+        return "<tr><td>" + email + "</td><td>" + action + "</td></tr>";
+      }).join("");
+    }
+
+    function loadList() {
+      google.script.run
+        .withSuccessHandler(render)
+        .withFailureHandler(function (err) {
+          addBtn.disabled = false;
+          setStatus(String(err && err.message ? err.message : err), true);
+        })
+        .apiAccessList();
+    }
+
+    formEl.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var email = inputEl.value.trim();
+      if (!email) return;
+      addBtn.disabled = true;
+      setStatus("Adding " + email + "…", false);
+      google.script.run
+        .withSuccessHandler(function (res) {
+          render(res);
+          if (res && res.ok) inputEl.value = "";
+        })
+        .withFailureHandler(function (err) {
+          addBtn.disabled = false;
+          setStatus(String(err && err.message ? err.message : err), true);
+        })
+        .apiAccessAdd(email);
+    });
+
+    bodyEl.addEventListener("click", function (event) {
+      var btn = event.target.closest("button[data-email]");
+      if (!btn) return;
+      var email = btn.getAttribute("data-email") || "";
+      btn.disabled = true;
+      setStatus("Removing " + email + "…", false);
+      google.script.run
+        .withSuccessHandler(render)
+        .withFailureHandler(function (err) {
+          btn.disabled = false;
+          setStatus(String(err && err.message ? err.message : err), true);
+        })
+        .apiAccessRemove(email);
+    });
+
+    loadList();
+  </script>
+</body>
+</html>

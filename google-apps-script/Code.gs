@@ -14,6 +14,8 @@
  *   DRIVE_FOLDER_ID    = <Drive folder id for HTML>        (optional)
  *   WRITE_HTML         = true|false                        (default true if folder set)
  *   WEBAPP_KEY         = optional shared secret; if set, require ?key=... on doGet
+ *   ACCESS_ADMIN       = owner email (set automatically from the account the script runs as)
+ *   APPROVED_USERS     = JSON list of approved emails (managed on the Access page)
  *   CHART_DAYS         = 30                                (optional; trend window)
  *   LW_USER            = registry username (e.g. 1234567|name) for packages.redhat.com
  *   LW_TOKEN           = registry token (Basic Auth password) — registry proxy + OSV index
@@ -55,6 +57,12 @@ function titleCase_(text) {
     });
 }
 
+function ecosystemLabel_(eco) {
+  var key = String(eco || "").toLowerCase();
+  if (key === "maven") return "Java";
+  return titleCase_(eco);
+}
+
 /**
  * Web app entrypoint (Deploy → Web app → execute as Me).
  *
@@ -63,6 +71,7 @@ function titleCase_(text) {
  *   GET /exec?page=recent          → Recent Releases (newest 300)
  *   GET /exec?page=cve             → CVE / RHLW Lookup
  *   GET /exec?page=match           → Dependency Match
+ *   GET /exec?page=access          → approved-email list (owner only)
  *   GET /exec?page=registry&path=lightwell/…  → packages.redhat.com proxy (LW_USER / LW_TOKEN)
  *   GET /exec?action=run           → snapshot then dashboard
  *   GET /exec?key=SECRET           → when WEBAPP_KEY is set
@@ -81,18 +90,34 @@ function doGet(e) {
     );
   }
 
+  var gate;
+  try {
+    gate = requireApproved_();
+  } catch (err) {
+    return htmlOutput_(accessDeniedPage_(visitorEmail_()), "Access Denied");
+  }
+
   var page = String(params.page || "dashboard").toLowerCase();
   if (page === "browser") {
-    return serveHtmlPage_("Browser", linkKey, "Lightwell Catalog Browser");
+    return serveHtmlPage_("Browser", linkKey, "Lightwell Catalog Browser", gate);
   }
   if (page === "recent") {
-    return serveHtmlPage_("Recent", linkKey, "Lightwell Recent Releases");
+    return serveHtmlPage_("Recent", linkKey, "Lightwell Recent Releases", gate);
   }
   if (page === "cve") {
-    return serveHtmlPage_("Cve", linkKey, "Lightwell CVE / RHLW Lookup");
+    return serveHtmlPage_("Cve", linkKey, "Lightwell CVE / RHLW Lookup", gate);
   }
   if (page === "match") {
-    return serveHtmlPage_("Match", linkKey, "Lightwell Dependency Match");
+    return serveHtmlPage_("Match", linkKey, "Lightwell Dependency Match", gate);
+  }
+  if (page === "access") {
+    if (!gate.admin) {
+      return htmlOutput_(
+        errorPage_("Access", "<p>Only the owner can manage the approved list.</p>", linkKey),
+        "Access"
+      );
+    }
+    return serveHtmlPage_("Allowlist", linkKey, "Lightwell Access", gate);
   }
   if (page === "registry") {
     return serveRegistryProxy_(params, linkKey);
@@ -113,6 +138,7 @@ function doGet(e) {
         source: "Google Apps Script Web app",
         chartDays: chartDays,
         webAppKey: linkKey,
+        showAccess: gate.admin,
         notice:
           action === "run"
             ? "Fresh snapshot written, then dashboard refreshed from the Sheet."
@@ -135,10 +161,12 @@ function doGet(e) {
 
 /** Include an HTML file from the Apps Script project (for templates). */
 function include(filename) {
+  requireApproved_();
   return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
 
-function serveHtmlPage_(filename, linkKey, title) {
+function serveHtmlPage_(filename, linkKey, title, gate) {
+  requireApproved_();
   var tpl = HtmlService.createTemplateFromFile(filename);
   tpl.urlDashboard = webAppHref_({ key: linkKey });
   tpl.urlBrowser = webAppHref_({ page: "browser", key: linkKey });
@@ -146,6 +174,8 @@ function serveHtmlPage_(filename, linkKey, title) {
   tpl.urlCve = webAppHref_({ page: "cve", key: linkKey });
   tpl.urlMatch = webAppHref_({ page: "match", key: linkKey });
   tpl.webAppKey = linkKey || "";
+  tpl.showAccess = !!(gate && gate.admin);
+  tpl.urlAccess = webAppHref_({ page: "access", key: linkKey });
   var base = "";
   try {
     base = ScriptApp.getService().getUrl() || "";
@@ -211,6 +241,7 @@ function webAppHref_(opts, maybeKey) {
 }
 
 function runCatalogSnapshot() {
+  requireApproved_();
   var result = runCatalogSnapshot_();
   Logger.log(
     "Wrote %s summary rows at %s",
@@ -220,6 +251,7 @@ function runCatalogSnapshot() {
 }
 
 function runCatalogSnapshot_() {
+  requireApproved_();
   var props = PropertiesService.getScriptProperties();
   var token = getAccessToken_(props);
   var rows = collectSummaryRows_(token);
@@ -235,6 +267,7 @@ function runCatalogSnapshot_() {
 
 /** Install daily triggers (idempotent). OSV index and snapshot at 08:00 and 15:00 SGT. */
 function installTriggers() {
+  requireApproved_();
   removeTriggers_();
   ScriptApp.newTrigger("syncOsvIndex")
     .timeBased()
@@ -268,17 +301,20 @@ function installTriggers() {
 }
 
 function removeTriggers() {
+  requireApproved_();
   removeTriggers_();
   Logger.log("Removed all project triggers");
 }
 
 function removeTriggers_() {
+  requireApproved_();
   ScriptApp.getProjectTriggers().forEach(function (t) {
     ScriptApp.deleteTrigger(t);
   });
 }
 
 function getAccessToken_(props) {
+  requireApproved_();
   var mode = (props.getProperty("AUTH_MODE") || "offline").toLowerCase();
   var payload;
   if (mode === "service_account") {
@@ -409,6 +445,7 @@ function metaCount_(token, path, params) {
 }
 
 function appendToSheet_(props, rows) {
+  requireApproved_();
   var ssId = required_(props, "SPREADSHEET_ID");
   var sheetName = props.getProperty("SHEET_NAME") || "CatalogSummary";
   var ss = SpreadsheetApp.openById(ssId);
@@ -437,6 +474,7 @@ function appendToSheet_(props, rows) {
 }
 
 function readAllSheetRows_(props) {
+  requireApproved_();
   var ssId = required_(props, "SPREADSHEET_ID");
   var sheetName = props.getProperty("SHEET_NAME") || "CatalogSummary";
   var ss = SpreadsheetApp.openById(ssId);
@@ -466,6 +504,7 @@ function normalizeStamp_(value) {
 }
 
 function maybeWriteHtml_(props) {
+  requireApproved_();
   var folderId = props.getProperty("DRIVE_FOLDER_ID");
   if (!folderId) {
     return;
@@ -500,6 +539,7 @@ function maybeWriteHtml_(props) {
  * Times/filters are applied in the browser (local timezone).
  */
 function buildCatalogPage_(allRows, options) {
+  requireApproved_();
   options = options || {};
   var chartDays = Number(options.chartDays || DEFAULT_CHART_DAYS);
   if (!isFinite(chartDays)) {
@@ -513,6 +553,10 @@ function buildCatalogPage_(allRows, options) {
   var hrefRecent = webAppHref_({ page: "recent", key: webAppKey });
   var hrefCve = webAppHref_({ page: "cve", key: webAppKey });
   var hrefMatch = webAppHref_({ page: "match", key: webAppKey });
+  var hrefAccess = webAppHref_({ page: "access", key: webAppKey });
+  var accessNav = options.showAccess
+    ? "<a href='" + esc_(hrefAccess) + "' target='_top' rel='noopener'>Access</a>"
+    : "";
   var generatedIso = formatStampSgt_(new Date());
 
   var latestAt = "";
@@ -546,18 +590,25 @@ function buildCatalogPage_(allRows, options) {
           : level === "remediated"
             ? "badge badge-remediated"
             : "badge";
+      var seriesKey = String(r[1] || "") + "|" + String(r[2] || "");
       return (
-        "<tr><td><span class='eco'>" +
-        esc_(titleCase_(r[1])) +
+        "<tr data-series='" +
+        esc_(seriesKey) +
+        "'><td><span class='eco'>" +
+        esc_(ecosystemLabel_(r[1])) +
         "</span></td><td><span class='" +
         levelClass +
         "'>" +
         esc_(titleCase_(level)) +
-        "</span></td><td class='num'>" +
+        "</span></td><td class='num'><span class='metric' data-metric='packages' data-value='" +
+        (Number(r[3]) || 0) +
+        "'>" +
         num(r[3]) +
-        "</td><td class='num'>" +
+        "</span></td><td class='num'><span class='metric' data-metric='versions' data-value='" +
+        (Number(r[4]) || 0) +
+        "'>" +
         num(r[4]) +
-        "</td></tr>"
+        "</span></td></tr>"
       );
     })
     .join("");
@@ -588,7 +639,7 @@ function buildCatalogPage_(allRows, options) {
         "'>" +
         esc_(stamp) +
         "</td><td>" +
-        esc_(titleCase_(r[1])) +
+        esc_(ecosystemLabel_(r[1])) +
         "</td><td><span class='" +
         levelClass +
         "'>" +
@@ -623,7 +674,7 @@ function buildCatalogPage_(allRows, options) {
         var key = eco + "|" + level;
         return {
           key: key,
-          label: eco + " · " + level,
+          label: ecosystemLabel_(eco) + " · " + titleCase_(level),
           color: SERIES_COLORS[key] || "#a1a1aa",
         };
       });
@@ -653,6 +704,17 @@ function buildCatalogPage_(allRows, options) {
       );
     })
     .join("");
+  var ecoButtons =
+    "<button type='button' class='seg-btn is-active' data-eco='' aria-pressed='true'>All</button>" +
+    ECOSYSTEMS.map(function (eco) {
+      return (
+        "<button type='button' class='seg-btn' data-eco='" +
+        esc_(eco) +
+        "' aria-pressed='false'>" +
+        esc_(ecosystemLabel_(eco)) +
+        "</button>"
+      );
+    }).join("");
 
   return (
     "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'/>" +
@@ -688,6 +750,7 @@ function buildCatalogPage_(allRows, options) {
     "<a href='" +
     esc_(hrefMatch) +
     "' target='_top' rel='noopener'>Dependency Match</a>" +
+    accessNav +
     "</nav>" +
     "<header class='hero'>" +
     "<div class='hero-copy'>" +
@@ -723,32 +786,44 @@ function buildCatalogPage_(allRows, options) {
     chartDays +
     "d</p></article>" +
     "</div>" +
-    "<section class='panel'>" +
-    "<div class='section-head section-head-stack'>" +
-    "<div class='section-title-row'>" +
+    "<section class='panel' id='pulsePanel'>" +
+    "<div class='pulse-head'>" +
+    "<h2>Last 3 days</h2>" +
+    "<p class='chart-sub' id='pulseRange'>Comparing snapshots…</p>" +
+    "</div>" +
+    "<div class='pulse-stats' id='pulseStats'></div>" +
+    "<div class='pulse-days' id='pulseDays'></div>" +
+    "<div id='pulseList'></div>" +
+    "</section>" +
+    "<section class='panel' id='trendPanel'>" +
+    "<div class='section-head'>" +
     "<h2 id='trendHeading'>Package Trend</h2>" +
-    "<div class='seg' role='group' aria-label='Trend Window Presets'>" +
+    "<div class='trend-controls'>" +
+    "<div class='seg' id='trendEco' role='group' aria-label='Ecosystem'>" +
+    ecoButtons +
+    "</div>" +
+    "<div class='seg' id='trendDays' role='group' aria-label='Trend Window Presets'>" +
     segButtons +
     "</div>" +
     "</div>" +
-    "<div class='range-row'>" +
-    "<label class='range-label' for='trendRange'>Window</label>" +
-    "<input type='range' id='trendRange' class='range' min='7' max='365' step='1' value='" +
-    chartDays +
-    "' aria-valuemin='7' aria-valuemax='365' aria-valuenow='" +
-    chartDays +
-    "' aria-label='Trend window days'/>" +
-    "<span class='range-value' id='trendRangeValue'>" +
-    chartDays +
-    "d</span>" +
     "</div>" +
     "<p class='chart-sub' id='chartRange'>Loading trend…</p>" +
-    "</div>" +
     "<div class='chart-wrap'><canvas id='catalogChart'></canvas></div>" +
     "</section>" +
-    "<section class='panel'>" +
+    "<section class='panel' id='snapshotPanel'>" +
+    "<div class='section-head'>" +
+    "<div>" +
     "<h2>Latest Snapshot</h2>" +
-    "<div class='table-wrap'><table><thead><tr>" +
+    "<p class='chart-sub snapshot-note' id='snapshotDeltaNote'>Comparing with the previous day…</p>" +
+    "</div>" +
+    "<div class='seg' id='snapshotDelta' role='group' aria-label='How far back to measure the change'>" +
+    "<button type='button' class='seg-btn is-active' data-days='1' aria-pressed='true'>1D</button>" +
+    "<button type='button' class='seg-btn' data-days='7' aria-pressed='false'>7D</button>" +
+    "<button type='button' class='seg-btn' data-days='14' aria-pressed='false'>14D</button>" +
+    "<button type='button' class='seg-btn' data-days='30' aria-pressed='false'>30D</button>" +
+    "</div>" +
+    "</div>" +
+    "<div class='table-wrap'><table id='snapshotTable'><thead><tr>" +
     "<th>Ecosystem</th><th>Security Level</th>" +
     "<th class='num'>Packages</th><th class='num'>Versions</th>" +
     "</tr></thead><tbody>" +
@@ -849,17 +924,26 @@ function dashboardClientScript_() {
     "});" +
     "var chartDays=Math.max(7,Math.min(365,Number(C.defaultDays)||30));" +
     "var chartObj=null;" +
-    "var rangeEl=document.getElementById('trendRange');" +
-    "var rangeVal=document.getElementById('trendRangeValue');" +
     "function syncControls(days){" +
     "  chartDays=Math.max(7,Math.min(365,Math.round(Number(days)||30)));" +
-    "  if(rangeEl){ rangeEl.value=String(chartDays); rangeEl.setAttribute('aria-valuenow',String(chartDays)); }" +
-    "  if(rangeVal) rangeVal.textContent=chartDays+'d';" +
-    "  document.querySelectorAll('.seg-btn').forEach(function(b){" +
+    "  document.querySelectorAll('#trendDays .seg-btn').forEach(function(b){" +
     "    var on=Number(b.getAttribute('data-days'))===chartDays;" +
     "    b.classList.toggle('is-active',on);" +
     "    b.setAttribute('aria-pressed',on?'true':'false');" +
     "  });" +
+    "}" +
+    "var chartEco='';" +
+    "function syncEco(){" +
+    "  document.querySelectorAll('#trendEco .seg-btn').forEach(function(b){" +
+    "    var on=(b.getAttribute('data-eco')||'')===chartEco;" +
+    "    b.classList.toggle('is-active',on);" +
+    "    b.setAttribute('aria-pressed',on?'true':'false');" +
+    "  });" +
+    "}" +
+    "function ecoLabel(){" +
+    "  if(!chartEco) return '';" +
+    "  var hit=(C.series||[]).filter(function(s){ return String(s.key||'').indexOf(chartEco+'|')===0; })[0];" +
+    "  return hit?String(hit.label||'').split(' · ')[0]:chartEco;" +
     "}" +
     "function buildPayload(days){" +
     "  var cutoff=Date.now()-days*24*60*60*1000;" +
@@ -881,36 +965,74 @@ function dashboardClientScript_() {
     "    labels:dayOrder.map(fmtDayLabel)," +
     "    rawDays:dayOrder," +
     "    datasets:(C.series||[]).map(function(s){" +
-    "      return {label:s.label,color:s.color,data:dayOrder.map(function(day){" +
+    "      return {key:s.key,label:s.label,color:s.color,data:dayOrder.map(function(day){" +
     "        var map=byStamp[dayLast[day]]||{};" +
     "        return Object.prototype.hasOwnProperty.call(map,s.key)?map[s.key]:null;" +
     "      })};" +
     "    })" +
     "  };" +
     "}" +
+    "function niceStep(span){" +
+    "  var rough=Math.max(span,1)/4;" +
+    "  var pow=Math.pow(10,Math.floor(Math.log10(rough)));" +
+    "  var err=rough/pow;" +
+    "  var nice=err>=7.5?10:(err>=3.5?5:(err>=1.5?2:1));" +
+    "  return nice*pow;" +
+    "}" +
+    "function fitScale(values,side){" +
+    "  var nums=values.filter(function(v){ return v!=null && isFinite(Number(v)); }).map(Number);" +
+    "  var scale={position:side||'left',beginAtZero:!nums.length,ticks:{color:'#9ca3af',callback:function(v){return Math.round(Number(v)).toLocaleString();}},grid:{color:side==='right'?'transparent':'rgba(255,255,255,0.04)',drawOnChartArea:side!=='right'}};" +
+    "  if(nums.length<1) return scale;" +
+    "  var min=Math.min.apply(null,nums), max=Math.max.apply(null,nums);" +
+    "  var span=max-min;" +
+    "  var pad=span>0?span*0.45:Math.max(Math.abs(max)*0.04,1);" +
+    "  var step=niceStep((max+pad)-Math.max(0,min-pad));" +
+    "  var lo=Math.max(0,Math.floor(Math.max(0,min-pad)/step)*step);" +
+    "  var hi=Math.ceil((max+pad)/step)*step;" +
+    "  if(hi<=lo) hi=lo+step;" +
+    "  if(hi<=max) hi=max+step;" +
+    "  scale.beginAtZero=false; scale.min=lo; scale.max=hi; scale.ticks.stepSize=step;" +
+    "  return scale;" +
+    "}" +
     "function renderChart(days){" +
     "  syncControls(days);" +
+    "  syncEco();" +
     "  var el=document.getElementById('statTrend'); if(el) el.textContent=chartDays+'d';" +
     "  var head=document.getElementById('trendHeading');" +
-    "  if(head) head.textContent='Package Trend (Last '+chartDays+' Days)';" +
+    "  var name=ecoLabel();" +
+    "  if(head) head.textContent='Package Trend (Last '+chartDays+' Days)'+(name?' · '+name:'');" +
     "  var payload=buildPayload(chartDays);" +
+    "  var shown=payload.datasets.filter(function(ds){" +
+    "    if(!chartEco) return true;" +
+    "    return String(ds.key||'').indexOf(chartEco+'|')===0;" +
+    "  });" +
+    "  var split=!!chartEco && shown.length>1;" +
     "  var range=document.getElementById('chartRange');" +
     "  if(range){" +
-    "    range.textContent=payload.labels.length" +
-    "      ? (payload.labels[0]+' → '+payload.labels[payload.labels.length-1]+' · '+payload.labels.length+' Snapshot'+(payload.labels.length===1?'':'s')+' · '+tz)" +
+    "    var base=payload.labels.length" +
+    "      ? (payload.labels[0]+' → '+payload.labels[payload.labels.length-1]+' · '+payload.labels.length+' Snapshot'+(payload.labels.length===1?'':'s'))" +
     "      : 'No Snapshot Data In This Window Yet — Run A Few Days Of Triggers First.';" +
+    "    range.textContent=payload.labels.length" +
+    "      ? (base+(split?' · each line scaled to its own range':(name?' · axis fitted to '+name:''))+' · '+tz)" +
+    "      : base;" +
     "  }" +
     "  var ctx=document.getElementById('catalogChart');" +
     "  if(!ctx||!window.Chart) return;" +
     "  if(chartObj) chartObj.destroy();" +
     "  Chart.defaults.color='#9ca3af';" +
     "  Chart.defaults.borderColor='rgba(255,255,255,0.06)';" +
+    "  var scales={" +
+    "    x:{ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:10,color:'#9ca3af'},grid:{color:'rgba(255,255,255,0.04)'}}," +
+    "    y: chartEco ? fitScale(shown.length?shown[0].data:[],'left') : {beginAtZero:true,ticks:{color:'#9ca3af',callback:function(v){return Number(v).toLocaleString();}},grid:{color:'rgba(255,255,255,0.04)'}}" +
+    "  };" +
+    "  if(split) scales.y1=fitScale(shown[1].data,'right');" +
     "  chartObj=new Chart(ctx,{" +
     "    type:'line'," +
     "    data:{" +
     "      labels:payload.labels," +
-    "      datasets:payload.datasets.map(function(ds){" +
+    "      datasets:shown.map(function(ds,i){" +
     "        return {label:ds.label,data:ds.data,borderColor:ds.color,backgroundColor:ds.color," +
+    "          yAxisID:split&&i>0?'y1':'y'," +
     "          tension:0.35,pointRadius:payload.labels.length>40?0:3,pointHoverRadius:5,borderWidth:2.25,spanGaps:true};" +
     "      })" +
     "    }," +
@@ -921,35 +1043,172 @@ function dashboardClientScript_() {
     "        tooltip:{backgroundColor:'#0a0a0a',titleColor:'#fafafa',bodyColor:'#d4d4d8',borderColor:'#27272a',borderWidth:1,padding:12," +
     "          callbacks:{label:function(c){var v=c.parsed.y; return c.dataset.label+': '+(v==null?'—':Number(v).toLocaleString());}}}" +
     "      }," +
-    "      scales:{" +
-    "        x:{ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:10,color:'#9ca3af'},grid:{color:'rgba(255,255,255,0.04)'}}," +
-    "        y:{beginAtZero:true,ticks:{color:'#9ca3af',callback:function(v){return Number(v).toLocaleString();}},grid:{color:'rgba(255,255,255,0.04)'}}" +
-    "      }" +
+    "      scales:scales" +
     "    }" +
     "  });" +
     "}" +
-    "document.querySelectorAll('.seg-btn').forEach(function(btn){" +
+    "document.querySelectorAll('#trendDays .seg-btn').forEach(function(btn){" +
     "  btn.addEventListener('click',function(){" +
     "    renderChart(Number(btn.getAttribute('data-days'))||30);" +
     "  });" +
     "});" +
-    "if(rangeEl){" +
-    "  var slideTimer=null;" +
-    "  function onSlide(){" +
-    "    var days=Number(rangeEl.value)||30;" +
-    "    if(rangeVal) rangeVal.textContent=days+'d';" +
-    "    document.querySelectorAll('.seg-btn').forEach(function(b){" +
-    "      var on=Number(b.getAttribute('data-days'))===days;" +
-    "      b.classList.toggle('is-active',on);" +
-    "      b.setAttribute('aria-pressed',on?'true':'false');" +
-    "    });" +
-    "    clearTimeout(slideTimer);" +
-    "    slideTimer=setTimeout(function(){ renderChart(days); },80);" +
-    "  }" +
-    "  rangeEl.addEventListener('input',onSlide);" +
-    "  rangeEl.addEventListener('change',onSlide);" +
+    "document.querySelectorAll('#trendEco .seg-btn').forEach(function(btn){" +
+    "  btn.addEventListener('click',function(){" +
+    "    chartEco=btn.getAttribute('data-eco')||'';" +
+    "    renderChart(chartDays);" +
+    "  });" +
+    "});" +
+    "function escHtml(s){" +
+    "  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');" +
     "}" +
+    "function titleWord(s){ s=String(s||''); if(!s) return '—'; if(s.toLowerCase()==='maven') return 'Java'; return s.charAt(0).toUpperCase()+s.slice(1); }" +
+    "function signed(n){ n=Number(n)||0; return (n>0?'+':'')+n.toLocaleString(); }" +
+    "function deltaClass(n){ n=Number(n)||0; return n>0?'delta-up':(n<0?'delta-down':'delta-flat'); }" +
+    "function pctText(now,then){" +
+    "  then=Number(then)||0; now=Number(now)||0; if(!then) return '';" +
+    "  var p=((now-then)/then)*100; return (p>0?'+':'')+p.toFixed(1)+'%';" +
+    "}" +
+    "function shiftDay(day,delta){" +
+    "  var parts=String(day||'').split('-'); if(parts.length!==3) return '';" +
+    "  var dt=new Date(Number(parts[0]),Number(parts[1])-1,Number(parts[2])+delta,12,0,0);" +
+    "  return localDay(dt.toISOString());" +
+    "}" +
+    "function renderPulse(){" +
+    "  var stats=document.getElementById('pulseStats');" +
+    "  var daysEl=document.getElementById('pulseDays');" +
+    "  var list=document.getElementById('pulseList');" +
+    "  var range=document.getElementById('pulseRange');" +
+    "  if(!stats||!list) return;" +
+    "  function say(msg){" +
+    "    if(range) range.textContent=msg;" +
+    "    stats.innerHTML=''; if(daysEl) daysEl.innerHTML='';" +
+    "    list.innerHTML='<p class=\"pulse-note\">'+escHtml(msg)+'</p>';" +
+    "  }" +
+    "  var latestStamp={};" +
+    "  (C.rows||[]).forEach(function(r){" +
+    "    var day=localDay(r.t); if(!day) return;" +
+    "    var stamp=String(r.t);" +
+    "    if(!latestStamp[day]||Date.parse(stamp)>Date.parse(latestStamp[day])) latestStamp[day]=stamp;" +
+    "  });" +
+    "  var dayKeys=Object.keys(latestStamp).sort();" +
+    "  if(dayKeys.length<2){ say('Need snapshots from at least two different days.'); return; }" +
+    "  var maps={};" +
+    "  dayKeys.forEach(function(day){ maps[day]={pkgs:{},vers:{},pkgTotal:0,verTotal:0}; });" +
+    "  (C.rows||[]).forEach(function(r){" +
+    "    var day=localDay(r.t); if(!day||String(r.t)!==latestStamp[day]) return;" +
+    "    var key=r.ecosystem+'|'+r.level;" +
+    "    maps[day].pkgs[key]=Number(r.packages)||0;" +
+    "    maps[day].vers[key]=Number(r.versions)||0;" +
+    "  });" +
+    "  dayKeys.forEach(function(day){" +
+    "    var bucket=maps[day];" +
+    "    Object.keys(bucket.pkgs).forEach(function(k){ bucket.pkgTotal+=bucket.pkgs[k]; bucket.verTotal+=bucket.vers[k]||0; });" +
+    "  });" +
+    "  var end=dayKeys[dayKeys.length-1];" +
+    "  var target=shiftDay(end,-3);" +
+    "  var start='';" +
+    "  for(var i=dayKeys.length-1;i>=0;i--){ if(dayKeys[i]<=target){ start=dayKeys[i]; break; } }" +
+    "  if(!start||start===end){ say('Not enough history yet. A 3-day change shows after a snapshot from three days earlier.'); return; }" +
+    "  var now=maps[end], then=maps[start];" +
+    "  var pkgDelta=now.pkgTotal-then.pkgTotal;" +
+    "  var verDelta=now.verTotal-then.verTotal;" +
+    "  if(range){" +
+    "    range.textContent=(start===target" +
+    "      ? (fmtDayLabel(start)+' → '+fmtDayLabel(end)+' · last snapshot each day')" +
+    "      : ('Since '+fmtDayLabel(start)+' · nearest snapshot on or before '+fmtDayLabel(target)));" +
+    "  }" +
+    "  function card(label,delta,nowN,thenN){" +
+    "    var pct=pctText(nowN,thenN);" +
+    "    return '<article class=\"pulse-card\"><p class=\"pulse-kicker\">'+escHtml(label)+'</p>'+" +
+    "      '<p class=\"pulse-num '+deltaClass(delta)+'\">'+escHtml(signed(delta))+'</p>'+" +
+    "      '<p class=\"pulse-note\">'+escHtml(Number(nowN).toLocaleString())+' now'+(pct?' · '+pct:'')+' · was '+escHtml(Number(thenN).toLocaleString())+'</p></article>';" +
+    "  }" +
+    "  stats.innerHTML=card('Packages',pkgDelta,now.pkgTotal,then.pkgTotal)+card('Versions',verDelta,now.verTotal,then.verTotal);" +
+    "  var strip=dayKeys.filter(function(day){ return day>=target && day<=end; });" +
+    "  if(start<target) strip.unshift(start);" +
+    "  if(daysEl){" +
+    "    var prev=null;" +
+    "    daysEl.innerHTML=strip.map(function(day){" +
+    "      var total=maps[day].pkgTotal;" +
+    "      var step=prev==null?null:(total-maps[prev].pkgTotal);" +
+    "      var html='<article class=\"pulse-day\"><span>'+escHtml(fmtDayLabel(day))+'</span><strong>'+escHtml(total.toLocaleString())+'</strong>'+" +
+    "        (step==null?'<span>baseline</span>':'<span class=\"'+deltaClass(step)+'\">'+escHtml(signed(step))+' packages</span>')+" +
+    "        '</article>';" +
+    "      prev=day; return html;" +
+    "    }).join('');" +
+    "  }" +
+    "  var keys={};" +
+    "  Object.keys(now.pkgs).forEach(function(k){ keys[k]=true; });" +
+    "  Object.keys(then.pkgs).forEach(function(k){ keys[k]=true; });" +
+    "  var rows=Object.keys(keys).map(function(k){" +
+    "    var parts=k.split('|');" +
+    "    return {name:titleWord(parts[0]),level:titleWord(parts[1]||''),pkg:(now.pkgs[k]||0)-(then.pkgs[k]||0),ver:(now.vers[k]||0)-(then.vers[k]||0)};" +
+    "  }).sort(function(a,b){ return Math.abs(b.pkg)-Math.abs(a.pkg)||(b.pkg-a.pkg); });" +
+    "  var maxAbs=rows.reduce(function(m,r){ return Math.max(m,Math.abs(r.pkg)); },0);" +
+    "  list.innerHTML=rows.map(function(r){" +
+    "    var width=!r.pkg||!maxAbs?0:Math.max(6,Math.round(Math.abs(r.pkg)/maxAbs*100));" +
+    "    return '<div class=\"pulse-row\"><div class=\"pulse-name\">'+escHtml(r.name)+'<small>'+escHtml(r.level)+'</small></div>'+" +
+    "      '<div class=\"pulse-track\" aria-hidden=\"true\"><i class=\"'+(r.pkg<0?'is-down':'')+'\" style=\"width:'+width+'%\"></i></div>'+" +
+    "      '<div class=\"pulse-delta '+deltaClass(r.pkg)+'\">'+escHtml(signed(r.pkg))+'<small>'+escHtml(signed(r.ver))+' versions</small></div></div>';" +
+    "  }).join('');" +
+    "}" +
+    "function renderSnapshotDelta(days){" +
+    "  days=Math.max(1,Math.round(Number(days)||1));" +
+    "  document.querySelectorAll('#snapshotDelta .seg-btn').forEach(function(b){" +
+    "    var on=Number(b.getAttribute('data-days'))===days;" +
+    "    b.classList.toggle('is-active',on);" +
+    "    b.setAttribute('aria-pressed',on?'true':'false');" +
+    "  });" +
+    "  var note=document.getElementById('snapshotDeltaNote');" +
+    "  var latestStamp={};" +
+    "  (C.rows||[]).forEach(function(r){" +
+    "    var day=localDay(r.t); if(!day) return;" +
+    "    var stamp=String(r.t);" +
+    "    if(!latestStamp[day]||Date.parse(stamp)>Date.parse(latestStamp[day])) latestStamp[day]=stamp;" +
+    "  });" +
+    "  var dayKeys=Object.keys(latestStamp).sort();" +
+    "  var maps={};" +
+    "  dayKeys.forEach(function(day){ maps[day]={pkgs:{},vers:{}}; });" +
+    "  (C.rows||[]).forEach(function(r){" +
+    "    var day=localDay(r.t); if(!day||String(r.t)!==latestStamp[day]) return;" +
+    "    var key=r.ecosystem+'|'+r.level;" +
+    "    maps[day].pkgs[key]=Number(r.packages)||0;" +
+    "    maps[day].vers[key]=Number(r.versions)||0;" +
+    "  });" +
+    "  var end=dayKeys.length?dayKeys[dayKeys.length-1]:'';" +
+    "  var target=end?shiftDay(end,-days):'';" +
+    "  var start='';" +
+    "  for(var i=0;i<dayKeys.length;i++){ if(dayKeys[i]>=target && dayKeys[i]<end){ start=dayKeys[i]; break; } }" +
+    "  if(!start){ for(var j=dayKeys.length-1;j>=0;j--){ if(dayKeys[j]<=target){ start=dayKeys[j]; break; } } }" +
+    "  var comparable=!!(start&&end&&start!==end);" +
+    "  if(note){" +
+    "    if(!end) note.textContent='No snapshot yet.';" +
+    "    else if(!comparable) note.textContent='No earlier snapshot to compare.';" +
+    "    else if(start===target) note.textContent='Added since '+fmtDayLabel(start)+' · last snapshot that day';" +
+    "    else note.textContent='Added since '+fmtDayLabel(start)+' · earliest snapshot in the last '+days+' day'+(days===1?'':'s');" +
+    "  }" +
+    "  document.querySelectorAll('#snapshotTable tbody tr[data-series]').forEach(function(tr){" +
+    "    var key=tr.getAttribute('data-series')||'';" +
+    "    tr.querySelectorAll('.metric').forEach(function(el){" +
+    "      var now=Number(el.getAttribute('data-value'))||0;" +
+    "      var delta=null;" +
+    "      if(comparable){" +
+    "        var bucket=el.getAttribute('data-metric')==='versions'?'vers':'pkgs';" +
+    "        delta=now-(maps[start][bucket][key]||0);" +
+    "      }" +
+    "      var badge=delta==null?'':'<span class=\"delta-badge '+deltaClass(delta)+'\">'+escHtml(signed(delta))+'</span>';" +
+    "      el.innerHTML=escHtml(now.toLocaleString())+badge;" +
+    "    });" +
+    "  });" +
+    "}" +
+    "document.querySelectorAll('#snapshotDelta .seg-btn').forEach(function(btn){" +
+    "  btn.addEventListener('click',function(){" +
+    "    renderSnapshotDelta(Number(btn.getAttribute('data-days'))||1);" +
+    "  });" +
+    "});" +
+    "renderSnapshotDelta(1);" +
     "renderChart(chartDays);" +
+    "renderPulse();" +
     "var allHist=Array.prototype.slice.call(document.querySelectorAll('#historyBody tr.hist-row'));" +
     "var page=1; var pageSize=C.pageSize||24;" +
     "var filtered=allHist.slice();" +
@@ -1040,11 +1299,40 @@ function catalogCss_() {
     ".stat{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1rem 1.05rem;backdrop-filter:blur(10px)}" +
     ".stat-label{margin:0;color:var(--muted);font-size:.72rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}" +
     ".stat-value{margin:.35rem 0 0;font-family:Sora,ui-sans-serif,sans-serif;font-size:1.45rem;font-weight:700;letter-spacing:-.03em;font-variant-numeric:tabular-nums}" +
+    ".pulse-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:.35rem .8rem;margin-bottom:.85rem}" +
+    ".pulse-head h2{margin:0}" +
+    ".pulse-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.75rem;margin-bottom:.9rem}" +
+    "@media (max-width:520px){.pulse-stats{grid-template-columns:1fr}}" +
+    ".pulse-card{border:1px solid var(--line);border-radius:14px;padding:.85rem .95rem;background:#0a0a0a}" +
+    ".pulse-card p{margin:0}" +
+    ".pulse-kicker{color:var(--muted);font-size:.72rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}" +
+    ".pulse-num{margin-top:.3rem;font-family:Sora,ui-sans-serif,sans-serif;font-size:1.7rem;font-weight:700;letter-spacing:-.03em;font-variant-numeric:tabular-nums}" +
+    ".pulse-note{margin-top:.2rem;color:var(--muted);font-size:.82rem}" +
+    ".delta-up{color:#4ade80}" +
+    ".delta-down{color:#fb7185}" +
+    ".delta-flat{color:var(--muted)}" +
+    ".pulse-days{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.55rem;margin-bottom:.95rem}" +
+    "@media (max-width:720px){.pulse-days{grid-template-columns:repeat(2,minmax(0,1fr))}}" +
+    ".pulse-day{border:1px solid var(--line);border-radius:12px;padding:.65rem .7rem;background:rgba(255,255,255,.02)}" +
+    ".pulse-day strong{display:block;margin-top:.15rem;font-variant-numeric:tabular-nums}" +
+    ".pulse-day span{color:var(--muted);font-size:.75rem}" +
+    ".pulse-day span.delta-up{color:#4ade80}" +
+    ".pulse-day span.delta-down{color:#fb7185}" +
+    ".pulse-row{display:grid;grid-template-columns:minmax(9rem,1.15fr) minmax(0,1.6fr) auto;gap:.65rem .8rem;align-items:center;padding:.62rem 0;border-top:1px solid var(--line)}" +
+    "@media (max-width:640px){.pulse-row{grid-template-columns:1fr auto;align-items:start}.pulse-track{grid-column:1 / -1;grid-row:2}}" +
+    ".pulse-name{font-weight:600;font-size:.9rem}" +
+    ".pulse-name small{display:block;color:var(--muted);font-weight:600;font-size:.75rem}" +
+    ".pulse-track{height:8px;border-radius:999px;background:rgba(255,255,255,.06);overflow:hidden}" +
+    ".pulse-track i{display:block;height:100%;border-radius:999px;background:#4ade80}" +
+    ".pulse-track i.is-down{background:#fb7185}" +
+    ".pulse-delta{text-align:right;font-variant-numeric:tabular-nums;font-weight:700}" +
+    ".pulse-delta small{display:block;color:var(--muted);font-weight:600;font-size:.75rem}" +
     ".panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:1.2rem 1.25rem 1.3rem;margin-bottom:1rem;backdrop-filter:blur(12px);box-shadow:0 20px 50px rgba(0,0,0,.35)}" +
     "h2{margin:0 0 .85rem;font-family:Sora,ui-sans-serif,sans-serif;font-size:1.02rem;font-weight:600;letter-spacing:-.02em;color:var(--ink)}" +
     ".section-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:.5rem .85rem;margin-bottom:.55rem}" +
     ".section-head-stack{flex-direction:column;align-items:stretch;gap:.75rem}" +
     ".section-title-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.65rem .85rem}" +
+    ".trend-controls{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:.45rem}" +
     ".section-head h2{margin:0}" +
     ".section-head .chart-sub{margin:0}" +
     ".chart-sub{margin:-.2rem 0 .85rem;color:var(--muted);font-size:.88rem}" +
@@ -1052,14 +1340,12 @@ function catalogCss_() {
     ".seg-btn{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-weight:700;font-size:.78rem;letter-spacing:.04em;padding:.42rem .78rem;border-radius:999px;cursor:pointer;transition:background .15s ease,color .15s ease}" +
     ".seg-btn:hover{color:var(--ink)}" +
     ".seg-btn.is-active{background:rgba(74,222,128,.16);color:#bbf7d0}" +
-    ".range-row{display:flex;align-items:center;gap:.75rem;margin:.15rem 0 .15rem}" +
-    ".range-label{font-size:.72rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);min-width:3.5rem}" +
-    ".range-value{font-family:Sora,ui-sans-serif,sans-serif;font-weight:700;font-variant-numeric:tabular-nums;min-width:3.2rem;text-align:right;color:var(--ink)}" +
-    ".range{flex:1;appearance:none;height:6px;border-radius:999px;background:linear-gradient(90deg,rgba(74,222,128,.35),rgba(56,189,248,.35));outline:none;cursor:pointer}" +
-    ".range::-webkit-slider-thumb{appearance:none;width:18px;height:18px;border-radius:50%;background:#4ade80;border:2px solid #052e16;box-shadow:0 0 0 4px rgba(74,222,128,.18);cursor:grab}" +
-    ".range::-webkit-slider-thumb:active{cursor:grabbing}" +
-    ".range::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#4ade80;border:2px solid #052e16;box-shadow:0 0 0 4px rgba(74,222,128,.18);cursor:grab}" +
-    ".range::-moz-range-track{height:6px;border-radius:999px;background:linear-gradient(90deg,rgba(74,222,128,.35),rgba(56,189,248,.35))}" +
+    ".snapshot-note{margin:.25rem 0 0}" +
+    ".metric{display:inline-flex;align-items:center;justify-content:flex-end;gap:.4rem}" +
+    ".delta-badge{display:inline-flex;align-items:center;border-radius:999px;padding:.04rem .42rem;font-size:.72rem;font-weight:700;line-height:1.45;letter-spacing:.01em;font-variant-numeric:tabular-nums}" +
+    ".delta-badge.delta-up{color:#bbf7d0;background:rgba(74,222,128,.16)}" +
+    ".delta-badge.delta-down{color:#fecdd3;background:rgba(251,113,133,.16)}" +
+    ".delta-badge.delta-flat{color:#a1a1aa;background:rgba(255,255,255,.06)}" +
     ".date-filters{display:flex;flex-wrap:wrap;align-items:end;gap:.65rem .75rem}" +
     ".date-field{display:flex;flex-direction:column;gap:.28rem;font-size:.72rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}" +
     ".date-field input[type=date]{font:inherit;font-size:.9rem;font-weight:600;letter-spacing:0;text-transform:none;color:var(--ink);background:#0a0a0a;border:1px solid var(--line);border-radius:10px;padding:.48rem .65rem;min-width:9.5rem;color-scheme:dark}" +

@@ -40,6 +40,7 @@ function syncOsvIndexContinue_() {
 }
 
 function syncOsvIndex_(force) {
+  requireApproved_();
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(8000)) {
     Logger.log("OSV sync skipped; another run holds the lock");
@@ -316,6 +317,7 @@ function clearOsvContinueTriggers_() {
 }
 
 function osvIndexFile_(create) {
+  requireApproved_();
   var props = PropertiesService.getScriptProperties();
   var id = props.getProperty(OSV_INDEX_PROP);
   if (id) {
@@ -342,6 +344,7 @@ function osvIndexFile_(create) {
 }
 
 function readOsvIndex_() {
+  requireApproved_();
   var file = osvIndexFile_(false);
   if (!file) return null;
   var text = "";
@@ -359,6 +362,7 @@ function readOsvIndex_() {
 }
 
 function saveOsvIndex_(index) {
+  requireApproved_();
   var file = osvIndexFile_(true);
   file.setContent(JSON.stringify(index));
   try {
@@ -367,6 +371,7 @@ function saveOsvIndex_(index) {
 }
 
 function osvAdvisoryFile_(create) {
+  requireApproved_();
   var props = PropertiesService.getScriptProperties();
   var id = props.getProperty(OSV_ADVISORY_PROP);
   if (id) {
@@ -393,6 +398,7 @@ function osvAdvisoryFile_(create) {
 }
 
 function readOsvAdvisories_() {
+  requireApproved_();
   var file = osvAdvisoryFile_(false);
   if (!file) return null;
   var text = "";
@@ -412,6 +418,7 @@ function readOsvAdvisories_() {
 }
 
 function saveOsvAdvisories_(rows) {
+  requireApproved_();
   var file = osvAdvisoryFile_(true);
   file.setContent(
     JSON.stringify({
@@ -524,6 +531,7 @@ function osvEcoLabel_(ecosystem) {
  * minScore: optional CVSS floor. Empty query returns the highest scores.
  */
 function lookupOsvAdvisories_(query, minScore) {
+  requireApproved_();
   var doc = readOsvAdvisories_();
   if (!doc) {
     return { ok: true, status: "missing", updated_at: "", total: 0, data: [] };
@@ -591,6 +599,7 @@ function osvAdvisoryHit_(row, q, kind) {
 }
 
 function loadOsvIndex_() {
+  requireApproved_();
   var cache = CacheService.getScriptCache();
   try {
     var cached = cache.get(OSV_CACHE_KEY);
